@@ -12,6 +12,8 @@ As long as you use functions defined or derived from this package for your resea
 Lei Xu*, Torkel B Brismar. Software architecture and manual for novel versatile CT image analysis toolbox -- AnatomyArchive. 
 https://doi.org/10.48550/arXiv.2507.13901
 
+You are recommended to read the preprint to get more information about the package including how to use it for your own work.  
+
 In case you've identify any errors when using the codes, you are welcome to report them by creating issues. The owner of the codes is happy to provide assistance within 
 an appropriate time frame.
 
