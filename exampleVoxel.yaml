@@ -1,0 +1,18 @@
+
+imageType:
+  Original: {}
+
+featureClass:
+  firstorder:
+  # glcm:
+
+setting:
+  binWidth: 25
+  force2D: false
+  label: 1
+
+voxelSetting:
+  kernelRadius: 2
+  maskedKernel: true
+  initValue: 0
+  voxelBatch: 10000
