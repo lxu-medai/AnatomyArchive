@@ -10,7 +10,8 @@ You are free to use, modify, and share the code for **non-commercial research an
 
 As long as you use functions defined or derived from this package for your research work, you agree to cite our work: 
 Lei Xu*, Torkel B Brismar. Software architecture and manual for novel versatile CT image analysis toolbox -- AnatomyArchive. 
-https://doi.org/10.48550/arXiv.2507.13901
+https://doi.org/10.48550/arXiv.2507.13901 and also TotalSegmentator:
+Wasserthal, J., Breit, H.-C., Meyer, M.T., Pradella, M., Hinck, D., Sauter, A.W., Heye, T., Boll, D., Cyriac, J., Yang, S., Bach, M., Segeroth, M., 2023. TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images. Radiology: Artificial Intelligence. https://doi.org/10.1148/ryai.230024
 
 You are recommended to read the preprint to get more information about the package including how to use it for your own work.  
 
