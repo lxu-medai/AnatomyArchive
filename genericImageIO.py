@@ -12,7 +12,6 @@ import SimpleITK as sitk
 from volViewerVispy import volume_viewer
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from nibabel.orientations import apply_orientation, io_orientation, inv_ornt_aff, axcodes2ornt, ornt_transform
-from totalsegmentator.libs import get_config_dir
 from totalsegmentator.dicom_io import command_exists, download_dcm2niix
 
 
@@ -217,7 +216,7 @@ def dicom_to_nifti(input_path, output_path: Union[str, Path]):
     if isinstance(output_path, str):
         output_path = Path(output_path)
 
-    config_dir = get_config_dir()
+    config_dir = Path(os.environ["TOTALSEG_WEIGHTS_PATH"]) / "nnUNet" 
     if command_exists("dcm2niix"):
         dcm2niix = "dcm2niix"
     else:
