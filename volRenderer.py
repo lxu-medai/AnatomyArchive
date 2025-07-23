@@ -150,7 +150,7 @@ def merge_list_masks_and_convert_to_vtk_image(list_masks: List[np.ndarray], meta
     return mask
 
 
-def get_rendering_preset_from_xml(xml_file_name: str, name_preset: str):
+def get_rendering_preset_from_xml(name_preset: str, xml_file_name: str='presets.xml'):
     def to_nested_list(_list, n):
         return [_list[i:i + n] for i in range(0, len(_list), n)]
 
