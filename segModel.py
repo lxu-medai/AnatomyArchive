@@ -13,7 +13,8 @@ from scipy import ndimage
 from tqdm import tqdm
 from pathlib import Path
 from scipy import ndimage as ndi
-from typing import Union, List, Any
+from typing import Union, List
+from numpy.typing import NDArray
 from skimage import filters
 from skimage.segmentation import watershed
 from skimage.filters import threshold_multiotsu
@@ -888,7 +889,7 @@ def segment_bright_objects(img_2d, area_threshold=200):
     return img_seg
 
 
-def get_objects_at_border(mask_2d: np.ndarray[Any, np.dtype[np.bool_]], selected_border='all', buffer_size=0, bg_val=0,
+def get_objects_at_border(mask_2d: Union[np.ndarray, NDArray[np.bool_]], selected_border='all', buffer_size=0, bg_val=0,
                           in_place=False, mask=None, out=None):
     # It does the opposite to skimage.segmentation.clear_border to detect objects at borders
 
@@ -949,7 +950,7 @@ def get_objects_at_border(mask_2d: np.ndarray[Any, np.dtype[np.bool_]], selected
     return out
 
 
-def get_bbx_from_2d_mask(mask_2d: np.ndarray[np.bool_]):
+def get_bbx_from_2d_mask(mask_2d: NDArray[np.bool_]):
     mask_2d_new = normalized_image_to_8bit(mask_2d)
     cnt, _ = cv.findContours(mask_2d_new, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
     contour = cnt[0]
@@ -957,7 +958,7 @@ def get_bbx_from_2d_mask(mask_2d: np.ndarray[np.bool_]):
     return [x, y, w, h], contour
 
 
-def get_object_width_at_bottom(mask_2d: np.ndarray[np.bool_], position=0.2):
+def get_object_width_at_bottom(mask_2d: NDArray[np.bool_], position=0.2):
     bbx, _ = get_bbx_from_2d_mask(mask_2d)
     obj_bottom = int(round(bbx[3] * (1 - position)))
     mask_2d_cropped = mask_2d.copy()
@@ -1067,6 +1068,7 @@ def get_lb_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_
             fig.show()
 
     return seg_labeled, seg_prosthesis
+
 
 
 
