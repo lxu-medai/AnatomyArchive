@@ -102,8 +102,7 @@ def get_window_dict_by_key(key):
     body_window_dict_res = {}
     for k_part, v_part in new_window_dict.items():
         for k_tissue, v_tissue in v_part.items():
-            body_window_dict_res = body_window_dict_res | {
-                k_part + ' ' + k_tissue: [v_tissue['Width'], v_tissue['Level']]}
+            body_window_dict_res.update({k_part + ' ' + k_tissue: [v_tissue['Width'], v_tissue['Level']]})
     return body_window_dict_res
 
 
@@ -124,11 +123,11 @@ def get_window_dict_from_dicom(dicom_attr):
     window_dict = {}
     if isinstance(window_name, list):
         for i in range(len(window_center)):
-            window_dict = window_dict | {window_name[i]: [int(window_width[i]), int(window_center[i])]}
+            window_dict.update({window_name[i]: [int(window_width[i]), int(window_center[i])]})
     else:
         window_dict = {window_name: [int(window_width), int(window_center)]}
     # Add window width and level for bones as a default setting
-    window_dict = window_dict | {'Bone': [1800, 400]}
+    window_dict.update({'Bone': [1800, 400]})
     return window_dict
 
 
@@ -264,3 +263,4 @@ def get_window_min_max_by_name(_obj_name: str, image_scaled: bool = True,
         _dict_window = triple_window_dict['Bone']
     else:
         _dict_window = triple_window_dict['SoftTissue']
+
