@@ -104,7 +104,39 @@ def get_body_component_attributes(img_3d: np.ndarray, img_3d_seg: np.ndarray, da
 def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_config: Union[dict, None] = None,
                             csv_file_name: Union[str, None] = None, inspect_plot_as_nifti: bool = False,
                             dataset_tag: Union[NestedDict, None] = None, hist_dict: Union[NestedDict, None] = None):
+    """
 
+    :param dir_input: input data directory
+    :param result_dict: extracted result as nested dict type
+    :param target_config: configuration for targeted variables, which should be of nested dict type.
+                          If not provided, it looks for a file named 'TargetEvaConfig.json' in the input data
+                          directory. If the file exists, the file is loaded and target_config is returned.
+                          Otherwise, an exception is announced.
+                          Example:
+                              target_config =
+                              {'refClassMap': 'total', # can be skipped if default 'total' is used.
+                               'total': {
+                                   # For 3D analysis:
+                                   'refObjUB': 'vertebrae_L1',
+                                   'refObjLB': 'pelvic',
+                                   # For 2D analysis:
+                                   # 'refObj': 'vertebrae_L3', # Observe that it is without 'UB'/'LB' annotations.
+                                   # DO NOT MIX REFERENCE OBJECTS FOR UPPER-& LOWER-BOUND WITH SINGLE REFERENCE OBJECT.
+                                   'excludeProsthesisSamples': True,
+                                   'selectedObjs': ['liver'] # Add whatever should be included
+                                   },
+                               'tissue_types':
+                                   {'selectedObjs': ['subcutaneous_fat', 'torso_fat','skeletal_muscle'],
+                                    'enforceMuscleRange': False
+                                   }
+                              }
+    :param csv_file_name: output csv file name of str or None type
+    :param inspect_plot_as_nifti: whether to save inspection plot in nifti image format
+    :param dataset_tag: intended for automatic data annotation in case if any errors or warnings are to be issued
+    :param hist_dict: variable to extract data histograms, nested dict or None type.
+    :return:
+    """
+                              
     def _analyze_components(_file_in):
         _file_in = os.path.join(dir_input, _file_in)
         skip = False
@@ -204,12 +236,15 @@ def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_confi
                                                   voxel_size, dict_bounds=dict_bounds, index_plane=index_plane,
                                                   mask_dict=mask_dict, hist_dict=hist_dict)
 
-    if target_eva_config is None:
-        with open(os.path.join(dir_input, 'TargetEvaConfig.json'), 'r') as h_config:
-            target_eva_config = json.load(h_config)
+    if target_config is None:
+        if os.path.isfile(os.path.join(dir_input, 'TargetEvaConfig.json')):
+            with open(os.path.join(dir_input, 'TargetEvaConfig.json'), 'r') as h_config:
+                target_config = json.load(h_config)
+        else:
+            raise ValueError(f"Input variable 'target_config' must be provided either as a dict or as json file "
+                             f"with name of 'TargetEvaConfig.json' within the path of {dir_input}")
     cls_map_name_ref = target_eva_config.get('refClassMap', 'total')
     # Need to add code to ensure that the refClassMap contains bones
-    files = get_files_in_folder(dir_input, 'nii.gz', 'seg')
     cls_map_names = list(target_eva_config.keys())
     cls_map_names.remove(cls_map_name_ref)
     if 'refClassMap' in cls_map_names:
@@ -230,8 +265,8 @@ def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_confi
         body_comp_type = -1
     if not os.path.isdir(os.path.join(dir_input, 'ResultInspection')):
         os.mkdir(os.path.join(dir_input, 'ResultInspection'))
-    # for i in tqdm(range(len(files)), desc=f'Performing body component analysis for {len(files)} patients.'):
-    #     file = files[i]
+    
+    files = get_files_in_folder(dir_input, 'nii.gz', 'seg')
     print(f'Performing body component analysis for {len(files)} patients.')
     p_map(_analyze_components, files)
     df = pd.DataFrame.from_dict(result_dict, orient='index')
@@ -964,4 +999,5 @@ def visualize_voxel_based_features_after_alpha_appending(image_array: np.ndarray
             if print_subplot_title:
                 axs[i, 2].title.set_text(subplot_titles[i+4])
     plt.show()
+
 
