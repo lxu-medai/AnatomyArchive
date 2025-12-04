@@ -6,35 +6,153 @@ import numpy as np
 import nibabel as nib
 from typing import Union, List
 
-
-def get_slices_from_file_path(dicom_path):
-    files = []
-    for root, dirs, file_names in os.walk(dicom_path):
-        for file in file_names:
-            try:
-                files.append(pydicom.dcmread(os.path.join(root, file)))
-            except pydicom.errors.InvalidDicomError:
-                print('\x1b[7;33;40m' + 'Non-DICOM file detected with file name of {}'.format(
-                    os.path.join(root, file)) + '\x1b[0m')
-    # noinspection PyUnresolvedReferences
-    files = [file for file in files if not isinstance(file, pydicom.dicomdir.DicomDir)]
-    # skip files with no SliceLocation (e.g. scout views)
-    slices = []
-    skip_count = 0
-    patient_id = files[0].PatientID
-    for i, f in enumerate(files):
-        if hasattr(f, 'SliceLocation'):
-            slices.append(f)
-            if i > 0:
-                assert (f.PatientID == patient_id)
+def get_axcode_for_orientation(scan_direction: str):
+    if scan_direction.lower() not in ['coronal', 'sagittal']:
+        if scan_direction.lower() not in ['axial', 'transverse']:
+            raise ValueError(f"Scan direction must be one of: 'axial/transverse', 'coronal', 'sagittal'. "
+                             f"Got: {scan_direction}")
         else:
-            skip_count = skip_count + 1
-    if skip_count != 0:
-        print('Total N0. of valid slices with {} skipped due to unspecified locations {} for patient {}.'
-              .format(len(slices), skip_count, patient_id))
-    scan_direction, reverse = get_scan_direction(slices[0])
-    slices = sorted(slices, key=lambda sl: sl.ImagePositionPatient[scan_direction], reverse=reverse)
-    return slices, patient_id
+            if scan_direction.lower() == 'axial':
+                scan_direction = 'transverse'
+    """
+    Returns all clinically valid orthogonal axcode for a given scan direction.
+    """
+
+    orientation_axes = {
+        'transverse': {
+            'slice_axes': ['S', 'I'],  # Slice direction must be Superior-Inferior
+            'in_plane_pairs': [('R', 'A'), ('R', 'P'), ('L', 'A'), ('L', 'P')]
+        },
+        'coronal': {
+            'slice_axes': ['A', 'P'],  # Slice direction must be Anterior-Posterior
+            'in_plane_pairs': [('R', 'S'), ('R', 'I'), ('L', 'S'), ('L', 'I')]
+        },
+        'sagittal': {
+            'slice_axes': ['R', 'L'],  # Slice direction must be Left-Right
+            'in_plane_pairs': [('A', 'S'), ('A', 'I'), ('P', 'S'), ('P', 'I')]
+        }
+    }
+
+    config = orientation_axes[scan_direction.lower()]
+    lst_axcode = []
+    for slice_axis in config['slice_axes']:
+        for row_axis, col_axis in config['in_plane_pairs']:
+            lst_axcode.append((row_axis, col_axis, slice_axis))
+
+    return lst_axcode
+
+
+def get_slices_from_file_path(dicom_path, return_dicom_slices: bool = True, select_scan_axis: [str, None] = None,
+                              save_nii_fpath: [str, None] = None):
+    dicom_dir = detect_dicom_dir(dicom_path)
+    # noinspection PyUnresolvedReferences
+    if isinstance(dicom_dir, pydicom.dicomdir.DicomDir):
+        result = split_slices_by_orientations_with_dcm_dir(dicom_dir, dicom_path, return_dicom_slices,
+                                                           select_scan_axis, save_nii_fpath)
+        patient_id = result['PatientID']
+    else:
+        patient_id = None
+        result = []
+        skip_counts = 0
+        axcode_filter = get_axcode_for_orientation(select_scan_axis) if select_scan_axis is not None else None
+        for root, dirs, file_names in os.walk(dicom_path):
+            for file in file_names:
+                file_full = os.path.join(root, file)
+                try:
+                    _dcm = pydicom.dcmread(file_full)
+                except pydicom.errors.InvalidDicomError:
+                    util.print_highlighted_text(f'Non-DICOM file detected with file name of {file_full}.')
+                else:
+                    if not hasattr(_dcm, 'SliceLocation'):
+                        skip_counts += 1
+                        continue
+                    if patient_id is None:
+                        patient_id = _dcm.PatientID
+                    else:
+                        if patient_id != _dcm.PatientID:
+                            util.print_highlighted_text(f'Inconsistent patient IDs detected in the DICOM files!')
+                            break
+                    _axc = get_axcode_from_dicom(_dcm)
+                    if axcode_filter is not None and _axc not in axcode_filter:
+                        continue
+                    else:
+                        # Skip scout images
+                        if 'scout' in _dcm.ScanOptions.lower() or 'local' in _dcm.ImageType[2].lower():
+                            continue
+                    result.append(_dcm if return_dicom_slices else file_full)
+        if skip_counts != 0:
+            print('{} invalid slices skipped due to unspecified locations for patient {}.'.format(skip_counts,
+                                                                                                  patient_id))
+    return result, patient_id
+
+
+# noinspection SpellCheckingInspection
+def detect_dicom_dir(dicom_path: str, dicom_dir_str: Union[str, None] = None, by_name: bool = True):
+    if by_name:
+        if dicom_dir_str is None:
+            dicom_dir_str = 'DICOMDIR'
+        dicom_dir_file = os.path.join(dicom_path, dicom_dir_str)
+        if os.path.isfile(dicom_dir_file):
+            dicom_dir = pydicom.dcmread(dicom_dir_file)
+        else:
+            dicom_dir = -1
+    else:
+        dicom_dir = -1
+        for root, dirs, file_names in os.walk(dicom_path):
+            for file in file_names:
+                try:
+                    _dcm = pydicom.dcmread(os.path.join(root, file))
+                except pydicom.errors.InvalidDicomError:
+                    util.print_highlighted_text(f'Non-DICOM file detected with file name of {os.path.join(root, file)}')
+                else:
+                    # noinspection PyUnresolvedReferences
+                    if isinstance(_dcm, pydicom.dicomdir.DicomDir):
+                        dicom_dir = _dcm
+                        break
+    return dicom_dir
+
+
+def get_slice_normal(dicom_file: pydicom.dataset.FileDataset):
+    r_cos, c_cos = (np.array(dicom_file.ImageOrientationPatient[:3]),
+                    np.array(dicom_file.ImageOrientationPatient[3:]))
+    slice_normal = np.cross(r_cos, c_cos)
+    slice_normal /= np.linalg.norm(slice_normal)  # Unit vector
+    return slice_normal
+
+
+def get_axcode_from_dicom(dicom_file: pydicom.dataset.FileDataset):
+    return nib.aff2axcodes(get_affine_from_dicom(dicom_file))
+
+
+def get_affine_from_dicom(slices: Union[pydicom.dataset.FileDataset, List[pydicom.dataset.FileDataset]],
+                          presorted: bool = False):
+    def _get_pseudo_affine_from_dicom(_dcm):
+        r_cos, c_cos = (np.array(_dcm.ImageOrientationPatient[:3]),
+                        np.array(_dcm.ImageOrientationPatient[3:]))
+        affine_pseudo = np.eye(4)
+        affine_pseudo[:3, 0] = r_cos
+        affine_pseudo[:3, 1] = c_cos
+        affine_pseudo[:3, 2] = np.cross(r_cos, c_cos)
+        return affine_pseudo
+
+    if not isinstance(slices, list):
+        # Single slice
+        affine = _get_pseudo_affine_from_dicom(slices)
+    else:
+        slices_sorted = sort_slices_by_position(slices) if not presorted else slices
+        dcm0 = slices_sorted[0]
+        affine = _get_pseudo_affine_from_dicom(dcm0)
+        if len(slices_sorted) > 1:
+            sx, sy = [float(x) for x in dcm0.PixelSpacing]
+            # It does not consider oblique scans
+            sz = get_slice_thickness(slices_sorted)
+            t = np.array(dcm0.ImagePositionPatient, dtype=float)
+            # affine_lps = np.eye()
+            affine[:3, 0] *= sx  # minus sign for X
+            affine[:3, 1] *= sy  # minus sign for Y
+            affine[:3, 2] *= sz
+            affine[:3, 3] = t
+    return affine
 
 
 def get_scan_direction(dicom_slice: pydicom.dataset.FileDataset, return_str: bool = False):
@@ -51,7 +169,7 @@ def get_scan_direction(dicom_slice: pydicom.dataset.FileDataset, return_str: boo
     return flag, reverse
 
 
-def sort_slices_by_position(slices, return_direction: bool = False, return_index: bool = False):
+def sort_slices_by_position(slices: List[pydicom.dataset.FileDataset], return_direction: bool = False, return_index: bool = False):
     scan_direction, reverse = get_scan_direction(slices[0])
     slices_sorted = sorted(slices, key=lambda _s: _s.ImagePositionPatient[scan_direction], reverse=reverse)
     if (not return_direction) and (not return_index):
@@ -65,6 +183,30 @@ def sort_slices_by_position(slices, return_direction: bool = False, return_index
                 return slices_sorted, scan_direction, indices
         else:
             return slices_sorted, scan_direction
+
+
+def get_slice_thickness(slices: List[pydicom.dataset.FileDataset], atol=0.001, presorted: bool = False):
+    slices_sorted = sort_slices_by_position(slices) if not presorted else slices
+    positions = np.array([_s.ImagePositionPatient for _s in slices_sorted])
+    slice_normal = get_slice_normal(slices_sorted[0])
+    spacings = np.dot(positions[1:] - positions[:-1], slice_normal)
+    if len(set(spacings)) != 1:
+        thickness_unq, thickness_idx, thickness_cnt = np.unique(spacings, return_inverse=True, return_counts=True)
+        thickness_main = thickness_unq[np.argmax(thickness_cnt)]
+        # Find the index of unique thickness value within tolerance limit of the most frequently occurring one.
+        # The np.where() returns a tuple of index array.
+        thickness_idx_tol = np.where(np.isclose(thickness_unq, thickness_main, atol=atol))[0]
+        if len(thickness_idx_tol) != 0:
+            # Remove the index of most frequently occurring thickness itself from the found index array
+            thickness_idx_tol = np.delete(thickness_idx_tol, np.where(thickness_idx_tol == np.argmax(thickness_cnt)))
+            for i in thickness_idx_tol:
+                idx_to_replace = spacings == thickness_unq[i]
+                spacings[idx_to_replace] = thickness_main
+        if np.max(np.unique(spacings)) / thickness_main >= 2:
+            print('There are large jumps during scanning...')
+    else:
+        thickness_main = spacings[0]
+    return thickness_main
 
 
 def check_and_split_slices_by_scan_settings(slices: List[pydicom.dataset.FileDataset], return_index: bool = False):
@@ -127,148 +269,129 @@ def check_and_split_slices_by_scan_settings(slices: List[pydicom.dataset.FileDat
                 return slices, flag, indices
 
 
-def parse_dicom_dir_and_convert_dicom2nii(dicom_dir_fpath: str, dict_series: Union[util.NestedDict, None] = None,
-                                          save_dir: Union[str, None] = None, get_slices: bool = False,
-                                          slice_specs: Union[util.NestedDict, None] = None,
-                                          return_dicom_dir: bool = False):
-    from dicom2nifti.convert_generic import dicom_to_nifti
+# noinspection PyUnresolvedReferences
+def split_slices_by_orientations_with_dcm_dir(dicom_dir: pydicom.dicomdir.DicomDir, dicom_path: str,
+                                              return_dicom_slices: bool = True, select_scan_axis: [str, None] = None,
+                                              save_nii_fpath: [str, None] = None):
+    if save_nii_fpath is not None:
+        from dicom2nifti.convert_generic import dicom_to_nifti
 
-    def convert_slices_to_nifti_image(_slices_, _series_descr: str, _nii_file_name: Union[str, None] = None):
-        try:
-            img_nii = dicom_to_nifti(_slices_, _nii_file_name)['NII']
-        except Exception:
-            util.print_highlighted_text(f"Error in converting slices to NifTi image for series: "
-                                        f"{_series_descr}")
-            return -1
+    def _append_dcm_to_nested_dict(_dict, _content, key_str='Data'):
+        if key_str not in _dict.keys():
+            _dict[key_str] = dict()
+        if key_str != 'Data':
+            if _axc not in _dict[key_str].keys():
+                _dict[key_str][_axc] = _content
+            else:
+                if isinstance(_dict[key_str][_axc], (pydicom.dataset.FileDataset, str)):
+                    # noinspection SpellCheckingInspection
+                    util.print_highlighted_text(f'Multiple scout images of the same orientation with axcodes '
+                                                f'corresponding to {_axc} are provided!')
+                    _dict[key_str][_axc] = [_dict[key_str][_axc]]
+                else:
+                    _dict[key_str][_axc].append(_content)
         else:
-            return img_nii
+            if _axc not in _dict[key_str].keys():
+                _dict[key_str][_axc] = list()
+            _dict[key_str][_axc].append(_content)
 
-    def validate_slices(_slices, idx_internal: Union[int, None] = None):
-        is_enhanced = True if hasattr(_slices[0], 'ContrastBolusAgent') and \
-                              _slices[0].ContrastBolusAgent != 'No' else False
-        if is_enhanced:
-            time_acq = min([_sl.timestamp for _sl in _slices])
-            times_acq.append(time_acq)
-            if idx_internal is None:
-                dict_series[patient_id][study_id]['Exams'][i]['CE'] = 1
-                dict_series[patient_id][study_id]['Exams'][i]['DeltaTime'] = time_acq
-            else:
-                dict_series[patient_id][study_id]['Exams'][i][idx_internal]['CE'] = 1
-                dict_series[patient_id][study_id]['Exams'][i][idx_internal]['DeltaTime'] = time_acq
+    def _append_data_to_dict(_content, key_str='Data'):
+        if not has_multiple_levels:
+            _append_dcm_to_nested_dict(series_dict, _content, key_str)
         else:
-            if hasattr(_slices[0], 'ContrastBolusAgent'):
-                print(_slices[0].ContrastBolusAgent)
-        if idx_internal is None:
-            if get_slices:
-                dict_series[patient_id][study_id]['Exams'][i]['Slices'] = _slices
-        else:
-            if get_slices:
-                dict_series[patient_id][study_id]['Exams'][i][idx_internal]['Slices'] = _slices
-        if idx_internal is None:
-            series_descr = f'{study_id}_{i}_{study_descr}'
-        else:
-            series_descr = f'{study_id}_{i}_{idx_internal}_{study_descr}'
-        if len(_slices) <= 3:
-            print(f'Scout image: {series_descr}')
-        else:
-            if save_dir is not None:
-                if not os.path.exists(os.path.join(save_dir, patient_id, study_id)):
-                    os.makedirs(os.path.join(save_dir, patient_id, study_id))
-                if is_enhanced:
-                    nii_file_name = os.path.join(save_dir, patient_id, study_id,
-                                                 f'{patient_id}_{series_descr}_CE.nii.gz')
-                else:
-                    nii_file_name = os.path.join(save_dir, patient_id, study_id,
-                                                 f'{patient_id}_{series_descr}.nii.gz')
-                if not os.path.isfile(nii_file_name):
-                    print(f'Save image: {nii_file_name}')
-                    img_nii = convert_slices_to_nifti_image(_slices, series_descr, nii_file_name)
-                else:
-                    img_nii = nib.load(nii_file_name)
-            else:
-                img_nii = convert_slices_to_nifti_image(_slices, series_descr, None)
-            # One may want to add tags about the assigned phases in slice_specs.
-            # But this is phase assignment is not done yet.
-            if slice_specs is not None:
-                if idx_internal is None:
-                    slice_specs[patient_id][study_id][i] = [files_dir[_i] for _i in list_indices]
-                else:
-                    slice_specs[patient_id][study_id][i][idx_internal] = [files_dir[_i] for _i in
-                                                                          list_indices[idx_internal]]
-            if (not get_slices) and (save_dir is not None):
-                if isinstance(img_nii, nib.Nifti1Image):
-                    if idx_internal is None:
-                        dict_series[patient_id][study_id]['Exams'][i]['NII'] = img_nii.get_filename()
+            if has_multiple_exams:
+                if not has_multiple_series:
+                    if study_id not in series_dict.keys():
+                        _dct = dict()
+                        series_dict[study_id] = _dct
                     else:
-                        dict_series[patient_id][study_id]['Exams'][i][idx_internal]['NII'] = img_nii.get_filename()
+                        _dct = series_dict[study_id]
                 else:
-                    util.print_highlighted_text(f"Failure occurred when processing {series_descr}, "
-                                                f"further analysis will be skipped!")
+                    if study_id not in series_dict.keys() or series_descr not in series_dict[study_id].keys():
+                        _dct = dict()
+                        series_dict[study_id][series_descr] = _dct
+                    else:
+                        _dct = series_dict[study_id][series_descr]
+            else:
+                if series_descr not in series_dict.keys():
+                    _dct = dict()
+                    series_dict[series_descr] = _dct
+                else:
+                    _dct = series_dict[series_descr]
+            _append_dcm_to_nested_dict(_dct, _content, key_str)
 
-    dicom_dir = pydicom.dcmread(dicom_dir_fpath)
-    if dict_series is None:
-        dict_series = util.NestedDict()
+    def _convert_slices_to_nifti_image(_series_descr: Union[str, None] = None):
+
+        for _ort in _data_dict.keys():
+            _slices = _data_dict[_ort]
+            _slices_sorted = sort_slices_by_position(_slices)
+            if save_nii_fpath is not None:
+                _series_descr = f'{patient_id}_{_series_descr}_{_ort}' if isinstance(_series_descr, str) else\
+                    f'{patient_id}_{_ort}'
+                _nii_filename = os.path.join(save_nii_fpath, f'{_series_descr}.nii.gz')
+                try:
+                    _ = dicom_to_nifti(_slices_sorted, _nii_filename)['NII']
+                except Exception:
+                    util.print_highlighted_text(f"Error in converting slices of axcode {_ort} to NifTi image for series"
+                                                f" {_series_descr}")
+                else:
+                    if not return_dicom_slices:
+                        _data_dict[_ort] = _nii_filename
+
+    series_dict = dict()
+    axcode_filter = get_axcode_for_orientation(select_scan_axis) if select_scan_axis is not None else None
+    # Currently it assumes that different records come from the same patient
     for _record in dicom_dir.patient_records:
         patient_id = _record.PatientID
-        if hasattr(_record, 'PatientSex') and _record.PatientSex in ['M', 'F']:
-            if 'Gender' not in dict_series[patient_id].keys():
-                dict_series[patient_id]['Gender'] = _record.PatientSex
+        series_dict['PatientID'] = patient_id
+        has_multiple_exams = len(_record.children) != 1
         for _exam in _record.children:
             study_id = f'{_exam.StudyDate}_{_exam.StudyID}'
-            study_descr = util.concatenate_substrings(_exam.StudyDescription)
-            times_acq = list()
-            for i,  _series in enumerate(_exam.children):
-                info_slices = _series.children
-                slices = list()
-                if slice_specs is not None:
-                    files_dir = list()
-                sub_folder_name = os.path.join(os.path.dirname(dicom_dir_fpath),
-                                               os.sep.join(info_slices[0].ReferencedFileID[:-1]))
-                print(f"Process {patient_id} on {study_id} from {sub_folder_name}")
-                for _s in info_slices:
-                    file_name = os.path.join(os.path.dirname(dicom_dir_fpath), os.sep.join(_s.ReferencedFileID))
-                    try:
-                        file = pydicom.dcmread(file_name)
-                    except pydicom.errors.InvalidDicomError:
-                        util.print_highlighted_text('Non-DICOM file detected with file name of {}'.format(file_name))
-                    else:
-                        slices.append(file)
-                        if slice_specs is not None:
-                            # noinspection PyUnboundLocalVariable
-                            files_dir.append(file_name)
-                if 'PatientAge' not in dict_series[patient_id][study_id].keys():
-                    if hasattr(slices[0], 'PatientAge'):
-                        find_age = re.search('(\d+)Y', slices[0].PatientAge)
-                        age = int(find_age.group(1)) if find_age else 'NA'
-                    else:
-                        age = 'NA'
-                    dict_series[patient_id][study_id]['PatientAge'] = age
-                if hasattr(slices[0], 'ImageOrientationPatient') and len(slices) > 1:
-                    if slice_specs is None:
-                        list_slices, flag_split = check_and_split_slices_by_scan_settings(slices)
-                    else:
-                        list_slices, flag_split, list_indices = check_and_split_slices_by_scan_settings(slices,
-                                                                                                        return_index=True)
-                    if flag_split == 0:
-                        validate_slices(list_slices)
-                    else:
-                        print(f'Multiple series found: {study_id}_{i}_{study_descr}')
-                        for j in range(len(list_slices)):
-                            validate_slices(list_slices[j], j)
+            has_multiple_series = len(_exam.children) != 1
+            for i, _series in enumerate(_exam.children):
+                has_multiple_levels = has_multiple_exams or has_multiple_series
+                if hasattr(_series, 'SeriesDescription'):
+                    series_descr = util.concatenate_substrings(_series.SeriesDescription)
                 else:
-                    continue
-            if len(times_acq) > 1:
-                time_start = min(times_acq)
-                for _k, _v in dict_series[patient_id][study_id]['Exams'].items():
-                    if isinstance(list(_v.keys())[0], str):
-                        if 'CE' in _v.keys() and _v['CE'] == 1:
-                            _v['DeltaTime'] -= time_start
+                    series_descr = f'{study_id}_{_series.SeriesNumber}' if not has_multiple_exams else\
+                        f'{_series.SeriesNumber}'
+                skip_counts = 0
+                for _dcm_meta in _series.children:
+                    _file = os.path.join(dicom_path, os.sep.join(_dcm_meta.ReferencedFileID))
+                    _dcm = pydicom.dcmread(_file)
+                    if not hasattr(_dcm, 'SliceLocation'):
+                        skip_counts += 1
+                        continue
+
+                    _axc0 = get_axcode_from_dicom(_dcm)
+                    # Reconstruct axcode as string from _axc0 by removing ',' from tuple.
+                    _axc = ''.join([e for e in _axc0])
+                    if axcode_filter is not None and _axc0 not in axcode_filter:
+                        continue
                     else:
-                        for _kk, _vv in _v.items():
-                            if 'CE' in _vv.keys() and _vv['CE'] == 1:
-                                _vv['DeltaTime'] -= time_start
-    if return_dicom_dir:
-        return dict_series, dicom_dir
-    else:
-        return dict_series
+                        if 'scout' in _dcm.ScanOptions.lower() or 'local' in _dcm_meta.ImageType[2].lower():
+                            _append_data_to_dict(_dcm if return_dicom_slices else _file, 'Scout')
+                        else:
+                            _append_data_to_dict(_dcm if return_dicom_slices else _file)
+                if skip_counts != 0:
+                    print('{} invalid slices skipped due to unspecified locations for patient {} of series {} at exam '
+                          '{}.'.format(skip_counts, patient_id, series_descr, study_id))
+        studies = [_k for _k in series_dict.keys() if _k != 'PatientID']
+        for _sid in studies:
+            _exam_dict = series_dict[_sid]
+            if _sid != 'Data':
+                if 'Data' in _exam_dict.keys():
+                    _data_dict = _exam_dict['Data']
+                    _convert_slices_to_nifti_image(_sid.replace('.', 'p'))
+                else:
+                    for _k in _exam_dict.keys():
+                        if 'Data' in _exam_dict[_k].keys():
+                            _data_dict = _exam_dict[_k]['Data']
+                            _convert_slices_to_nifti_image(f"{_sid}_{_k.replace('.', 'p')}")
+            else:
+                _data_dict = _exam_dict
+                _convert_slices_to_nifti_image()
+
+    return series_dict
+
 
