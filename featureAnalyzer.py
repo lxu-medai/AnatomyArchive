@@ -263,7 +263,7 @@ def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_confi
     if not os.path.isdir(os.path.join(dir_input, 'ResultInspection')):
         os.mkdir(os.path.join(dir_input, 'ResultInspection'))
     
-    files = get_files_in_folder(dir_input, 'nii.gz', 'seg')
+    files = get_files_in_folder(dir_input, 'nii.gz', 'seg', False)
     print(f'Performing body component analysis for {len(files)} patients.')
     p_map(_analyze_components, files)
     df = pd.DataFrame.from_dict(result_dict, orient='index')
@@ -996,6 +996,7 @@ def visualize_voxel_based_features_after_alpha_appending(image_array: np.ndarray
             if print_subplot_title:
                 axs[i, 2].title.set_text(subplot_titles[i+4])
     plt.show()
+
 
 
 
