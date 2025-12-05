@@ -137,6 +137,7 @@ def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_confi
     :return:
     """
                               
+    # noinspection SpellCheckingInspection                          
     def _analyze_components(_file_in):
         _file_in = os.path.join(dir_input, _file_in)
         skip = False
@@ -244,11 +245,7 @@ def body_component_analysis(dir_input, result_dict: NestedDict, target_eva_confi
             raise ValueError(f"Input variable 'target_config' must be provided either as a dict or as json file "
                              f"with name of 'TargetEvaConfig.json' within the path of {dir_input}")
     cls_map_name_ref = target_eva_config.get('refClassMap', 'total')
-    # Need to add code to ensure that the refClassMap contains bones
-    cls_map_names = list(target_eva_config.keys())
-    cls_map_names.remove(cls_map_name_ref)
-    if 'refClassMap' in cls_map_names:
-        cls_map_names.remove('refClassMap')
+    cls_map_names = [_k for _k in target_config.keys() if _k not in ['refClassMap', cls_map_name_ref]]
     target_dict_main = target_eva_config[cls_map_name_ref]
     objs_sel_main = target_dict_main.get('selectedObjs', None)
     coarse = target_dict_main.get('coarse', None)
@@ -999,5 +996,6 @@ def visualize_voxel_based_features_after_alpha_appending(image_array: np.ndarray
             if print_subplot_title:
                 axs[i, 2].title.set_text(subplot_titles[i+4])
     plt.show()
+
 
 
