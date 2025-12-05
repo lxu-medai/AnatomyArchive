@@ -21,6 +21,7 @@ This package is based on the full body segmentation open-weight model:
 Wasserthal, J., Breit, H.-C., Meyer, M.T., Pradella, M., Hinck, D., Sauter, A.W., Heye, T., Boll, D., Cyriac, J., Yang, S., Bach, M., Segeroth, M., 2023. TotalSegmentator: Robust Segmentation of 104 Anatomic Structures in CT Images. Radiology: Artificial Intelligence. https://doi.org/10.1148/ryai.230024
 
 # Example for doing body composition
+```
 from totalsegmentator.config import setup_nnunet
 from featureAnalyzer import body_component_analysis, NestedDict
 
@@ -41,5 +42,5 @@ if __name__ == '__main__':
                                  }
                   }
   body_component_analysis(dir_data, result_dict, target_config)
-  
+```
   
