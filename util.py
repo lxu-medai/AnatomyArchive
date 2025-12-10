@@ -1,14 +1,15 @@
+import os
+import re
+import json
 import warnings
 import numpy as np
-import os
-from typing import List, Union
-import matplotlib.pyplot as plt
-import json
-import shutil
-from functools import reduce
 import operator
-import re
 import pandas as pd
+import networkx as nx
+from shutil import copytree
+from functools import reduce
+import matplotlib.pyplot as plt
+from typing import Union, Set, List, Optional, Callable
 
 
 class NpEncoder(json.JSONEncoder):
@@ -62,8 +63,7 @@ def copy_file(dir_src, dir_des, dict_patient_include):
                         continue
                     else:
                         print(f'Copy files from {os.path.join(dir_src, cls, _f)} to {dir_des}...')
-                        shutil.copytree(os.path.join(dir_src, cls, _f), os.path.join(dir_des, cls,
-                                                                                     str(_f).split(' ')[0]))
+                        copytree(os.path.join(dir_src, cls, _f), os.path.join(dir_des, cls, str(_f).split(' ')[0]))
                     bar.update(num)
 
 
@@ -208,7 +208,7 @@ def get_value_in_nested_dict_by_path(_dict: dict, _path: Union[list, tuple]):
     return reduce(operator.getitem, _path, _dict)
 
 
-def swap_tuple(_tuple, a, b):
+def swap_tuple(_tuple, a: int, b: int):
     _list = list(_tuple)
     _list[b], _list[a] = _list[a], _list[b]
     return tuple(_list)
@@ -224,6 +224,13 @@ def resample_with_low_repeats(_list: list, size: int, random_seed: int = 1):
         indices = np.random.choice(np.repeat(np.arange(num), int(np.ceil(size/num))), size, replace=False)
     new_list = [_list[i] for i in indices]
     return new_list
+
+
+def set_color_labels_for_display(cls_map: dict):
+    num_labels = len(cls_map)
+    colors = set_colors(num_labels)
+    dict_colors = {k: colors[i, :] for i, k in enumerate(cls_map.keys())}
+    return dict_colors
 
 
 def remove_empty_nested_keys(_dict, reset_dict_to_count=False, count_ini=0):
@@ -337,3 +344,204 @@ def normalized_image_to_8bit(img: np.ndarray):
     img_8bit = img_8bit.astype(np.uint8)
     return img_8bit
 
+
+class DirectoryGraph:
+    """A class for building directory structures as NetworkX graphs with file filtering."""
+
+    def __init__(self, root_path: str):
+        """
+        Initialize the DirectoryGraph.
+
+        Args:
+            root_path: Path to the root directory to analyze
+        """
+        self.root_path = os.path.abspath(root_path)
+        if not os.path.exists(self.root_path):
+            raise ValueError(f"Path does not exist: {root_path}")
+
+        self.graph = nx.DiGraph()
+        self._leaf_nodes = None
+
+    def build_graph(
+            self,
+            include_files: bool = False,
+            max_depth: Optional[int] = None,
+            file_filter: Optional[Callable[[str], bool]] = None,
+    ) -> nx.DiGraph:
+        """
+        Build a NetworkX graph representing the directory structure.
+
+        Args:
+            include_files: If True, include files in the graph
+            max_depth: Maximum depth to traverse (None for unlimited)
+            file_filter: Function that takes a file path and returns True if
+                         the file should be considered when checking directories.
+
+        Returns:
+            A NetworkX DiGraph representing the filtered directory structure
+        """
+        self.graph = nx.DiGraph()
+        self._leaf_nodes = None
+        require_file_in_leaf = True if file_filter is not None else False
+        # Start DFS from root
+        stack = [(self.root_path, 0, None, False)]  # (path, depth, parent_path, is_valid)
+
+        while stack:
+            current_path, depth, parent_path, parent_valid = stack.pop()
+
+            # Skip if beyond max depth
+            if max_depth is not None and depth > max_depth:
+                continue
+
+            # Check if we should process this directory
+            should_process = True
+            if require_file_in_leaf and not parent_valid and depth > 0:
+                # If parent wasn't valid and we require files in leaves,
+                # skip processing this branch entirely
+                should_process = False
+
+            if not should_process:
+                continue
+
+            # Initialize this directory's validity
+            current_valid = False
+
+            # Check files in this directory
+            try:
+                items = os.listdir(current_path)
+            except (PermissionError, OSError):
+                continue
+
+            # Process items
+            subdirs = []
+            matching_files_found = False
+
+            for item in items:
+                item_path = os.path.join(current_path, item)
+                if os.path.isdir(item_path):
+                    subdirs.append(item_path)
+                elif os.path.isfile(item_path):
+                    # Check if file matches filter
+                    if file_filter is not None and file_filter(item_path):
+                        matching_files_found = True
+
+            # Determine if current directory should be added to graph
+            should_add_to_graph = False
+
+            if not require_file_in_leaf:
+                # Always add directories if no file requirement
+                should_add_to_graph = True
+                current_valid = True
+            else:
+                # Only add if we have matching files or valid subdirectories will be added
+                if matching_files_found:
+                    should_add_to_graph = True
+                    current_valid = True
+                elif subdirs:
+                    # We might add it later if subdirectories are valid
+                    # For now, mark as potentially valid
+                    current_valid = True
+
+            # Add directory to graph if needed
+            if should_add_to_graph:
+                self.graph.add_node(
+                    current_path,
+                    label=os.path.basename(current_path),
+                    type='directory',
+                    depth=depth,
+                    path=current_path
+                )
+
+                # Add edge from parent if exists
+                if parent_path is not None and parent_path in self.graph:
+                    self.graph.add_edge(parent_path, current_path)
+
+                # Add files if requested
+                if include_files and matching_files_found:
+                    # Add only matching files
+                    for item in items:
+                        item_path = os.path.join(current_path, item)
+                        if os.path.isfile(item_path) and file_filter is not None and file_filter(item_path):
+                            self.graph.add_node(
+                                item_path,
+                                label=item,
+                                type='file',
+                                depth=depth + 1,
+                                path=item_path
+                            )
+                            self.graph.add_edge(current_path, item_path)
+
+            # Add subdirectories to stack
+            for subdir in subdirs:
+                stack.append((subdir, depth + 1, current_path, current_valid))
+
+        return self.graph
+
+    def get_leaf_directories(self) -> List[str]:
+        """
+        Get all leaf directories in the current graph.
+
+        Returns:
+            List of full paths to leaf directories
+        """
+        if self._leaf_nodes is not None:
+            return self._leaf_nodes.copy()
+
+        leaf_dirs = []
+        for node in self.graph.nodes():
+            if self.graph.nodes[node].get('type') != 'directory':
+                continue
+
+            # A directory is a leaf if it has no outgoing edges to other directories
+            has_subdirs = any(
+                self.graph.nodes[neighbor].get('type') == 'directory'
+                for neighbor in self.graph.successors(node)
+            )
+
+            if not has_subdirs:
+                leaf_dirs.append(node)
+
+        self._leaf_nodes = leaf_dirs
+        return leaf_dirs
+
+    # noinspection PyMethodMayBeStatic
+    def create_extension_filter(
+            self,
+            extensions: Set[str],
+            exclude_files: Optional[Set[str]] = None
+    ) -> Callable[[str], bool]:
+        """
+        Create a filter function for specific file extensions.
+
+        Args:
+            extensions: Set of file extensions to include (e.g., {'.txt', '.jpg'})
+            exclude_files: Set of specific filenames to exclude (case-insensitive)
+
+        Returns:
+            A function that can be used as a file_filter in build_graph
+        """
+        if exclude_files is None:
+            exclude_files = set()
+
+        # Convert to lowercase for case-insensitive comparison
+        extensions_lower = {ext.lower() for ext in extensions}
+        exclude_files_lower = {f.lower() for f in exclude_files}
+
+        def extension_filter(file_path: str) -> bool:
+            # Get filename and extension
+            filename = os.path.basename(file_path)
+            filename_lower = filename.lower()
+
+            # Check if filename is in exclude list
+            if filename_lower in exclude_files_lower:
+                return False
+
+            # Check extension using os.path.splitext
+            _, ext = os.path.splitext(filename)
+            return ext.lower() in extensions_lower
+
+        return extension_filter
+
+    def to_networkx(self) -> nx.DiGraph:
+        """Return the NetworkX graph object."""
+        return self.graph
