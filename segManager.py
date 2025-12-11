@@ -1,6 +1,5 @@
 import os
 import re
-import util
 import sparse
 import operator
 import numpy as np
@@ -12,9 +11,11 @@ from scipy import ndimage
 from typing import List, Union
 from functools import reduce
 from genericImageIO import convert_nifti_to_numpy
-from volViewerMPL import get_sectional_view_image, show_mask_superimposed_2d_image
-from segModel import get_v_dependent_cls_map, perform_segmentation_generic, image_resample
-from segModel import class_map, v_totalsegmentator, segmentation_settings, anatomy_name_standardization
+from volumeViewerMPL import get_sectional_view_image, show_mask_superimposed_2d_image
+from segModel import class_map, v_totalsegmentator, get_v_dependent_cls_map
+from segModel import remove_bed_with_model, segmentation_settings, anatomy_name_standardization
+from segModel import get_seg_config_by_task_name, perform_segmentation_generic, image_resample
+from util import print_highlighted_text, NestedDict, set_color_labels_for_display, get_files_in_folder
 
 
 def get_mask_cls_map_version_from_filename(nii_filename: str):
@@ -85,9 +86,10 @@ def download_totalsegmentator_pretrained_weights_with_license(config_file: dict,
     import requests
     from tqdm import tqdm
     import zipfile
+    from util import decode_string
 
     # It is important that the license number should be removed from the code prior to publication!!!
-    license_number = util.decode_string(config_file['LicenseNumber'])
+    license_number = decode_string(config_file['LicenseNumber'])
     config_dir = os.environ['RESULTS_FOLDER']
     assert config_dir is not None
     temp_file = os.path.join(config_dir, "tmp_download_file.zip")
@@ -140,14 +142,14 @@ def get_default_tissue_hu_range():
     return dict_hu_range
 
 
-def get_tissue_hierarchy_dict(class_map_name='total'):
-    cls_map = class_map[class_map_name]
+def get_tissue_hierarchy_dict(cls_map_name='total'):
+    cls_map = class_map[cls_map_name]
     list_anatomies = anatomy_name_standardization(cls_map)
     list_label = list(cls_map.keys())
     # list_type = [v.replace('hip', 'pelvic') if 'hip' in v else v.replace('autochthon', 'spinal_erectors')
     #               if 'autochthon' in v else v for k, v in cls_map_tot.items()]
     list_bones = get_preset_anatomy_groups()['bone']
-    tissue_dict = util.NestedDict()
+    tissue_dict = NestedDict()
     for _anatomy in list_anatomies:
         label = list_label[list_anatomies.index(_anatomy)]
         if any([b in _anatomy for b in list_bones]):
@@ -246,9 +248,9 @@ def segmentation_postfix(img_3d: np.ndarray, img_3d_seg: np.ndarray, task_name: 
         idx_components_selected = [list_labels.index(_l) for _l in list_labels_found]
     list_anatomies_selected = list()
     if v_totalsegmentator == 2 and task_name == 'tissue_4_types':
-        util.print_highlighted_text("The function for muscle fat range enforcement given by AnatomyArchive will not be"
-                                    " applied as the user chooses to use the segmentation results of 'tissue_4_types'"
-                                    " provided by TotalSegmentator")
+        print_highlighted_text("The function for muscle fat range enforcement given by AnatomyArchive will not be"
+                                " applied as the user chooses to use the segmentation results of 'tissue_4_types'"
+                                " provided by TotalSegmentator")
         process_without_modification(idx_components_selected)
     else:
         if enforce_muscle_fat_range:
@@ -283,7 +285,7 @@ def segmentation_postfix(img_3d: np.ndarray, img_3d_seg: np.ndarray, task_name: 
 
 def create_vol_segment_and_coo_component(img_3d: Union[np.ndarray, nib.nifti1.Nifti1Image],
                                          img_3d_seg: Union[np.ndarray, nib.nifti1.Nifti1Image], file_name: str,
-                                         data_dict: util.NestedDict, class_map_name: str = 'total',
+                                         data_dict: NestedDict, cls_map_name: str = 'total',
                                          save_data_array=False, with_hierarchy: bool = True,
                                          hist_dict: Union[dict, None] = None,
                                          bin_edges: Union[None, np.ndarray] = None):
@@ -306,9 +308,9 @@ def create_vol_segment_and_coo_component(img_3d: Union[np.ndarray, nib.nifti1.Ni
     if (bin_edges is None) and (hist_dict is not None):
         bin_edges = np.linspace(-1000, 1600, 261, endpoint=True)
     elif isinstance(bin_edges, np.ndarray) and (hist_dict is None):
-        hist_dict = util.NestedDict()
+        hist_dict = NestedDict()
     if with_hierarchy:
-        cls_map = get_tissue_hierarchy_dict(class_map_name)
+        cls_map = get_tissue_hierarchy_dict(cls_map_name)
         for cat in cls_map.keys():
             tissue_names_sub_cat = list(cls_map[cat].keys())
             for t in tissue_names_sub_cat:
@@ -339,7 +341,7 @@ def create_vol_segment_and_coo_component(img_3d: Union[np.ndarray, nib.nifti1.Ni
                         if hist_dict is not None:
                             hist_dict[cat][t] = np.histogram(img_3d[mask_binary], bins=bin_edges, density=True)[0]
     else:
-        cls_map = class_map[class_map_name]
+        cls_map = class_map[cls_map_name]
         for _label, _obj in cls_map.items():
             if _label not in labels_contained:
                 continue
@@ -360,13 +362,13 @@ def create_vol_segment_and_coo_component(img_3d: Union[np.ndarray, nib.nifti1.Ni
         fh.write(msgpack.packb(data_dict))
 
 
-def merge_and_store_vol_segments_in_nested_dict(file_in: str, class_map_name_list: List[str],
-                                                coarse_resolution: Union[bool, None] = True, uniform_size=False,
+def merge_and_store_vol_segments_in_nested_dict(file_in: str, cls_map_name_list: List[str],
+                                                coarse: Union[bool, None] = True, uniform_size=False,
                                                 save_data_array=False, bin_edges: Union[None, np.ndarray] = None,
                                                 return_data=False, with_hierarchy: bool = True):
-    assert all([_e in list(segmentation_settings.keys()) for _e in class_map_name_list])
+    assert all([_e in list(segmentation_settings.keys()) for _e in cls_map_name_list])
     img_3d = nib.load(file_in)
-    data_dict = util.NestedDict()
+    data_dict = NestedDict()
     if uniform_size:
         # noinspection PyTypeChecker
         img_3d = image_resample(img_3d)
@@ -379,19 +381,13 @@ def merge_and_store_vol_segments_in_nested_dict(file_in: str, class_map_name_lis
     data_dict['Shape'] = img_3d.shape
     # data_dict['DataArray'] = img_3d
     if isinstance(bin_edges, np.ndarray):
-        hist_dict = util.NestedDict()
+        hist_dict = NestedDict()
         return_hist_data = True
     else:
         hist_dict = None
         return_hist_data = False
-    for map_name in class_map_name_list:
-        if map_name in ['total', 'body']:
-            if (coarse_resolution is None) or (coarse_resolution is True):
-                seg_config = segmentation_settings[map_name]['coarse']
-            else:
-                seg_config = segmentation_settings[map_name]['fine']
-        else:
-            seg_config = segmentation_settings[map_name]
+    for map_name in cls_map_name_list:
+        seg_config = get_seg_config_by_task_name(map_name, coarse)
         img_3d_seg = perform_segmentation_generic(file_in, seg_config)
         if uniform_size:
             img_3d_seg = image_resample(img_3d_seg, remove_negative=True)
@@ -615,11 +611,11 @@ def inquire_target_in_graph(data_graph: nx.classes.multidigraph.MultiDiGraph, ta
     strs_inquire.sort()
     str_found = [s for s in strs_inquire if target_anatomy.lower() == s.lower()]
     if len(str_found) == 0:
-        util.print_highlighted_text(f"No exact matching of string '{target_anatomy}' is found!")
+        print_highlighted_text(f"No exact matching of string '{target_anatomy}' is found!")
         str_found = [s for s in strs_inquire if target_anatomy.lower() in s.lower()]
         if len(str_found) == 0:
-            util.print_highlighted_text(f"No exact matching of substring '{target_anatomy}' is found!\n"
-                                        f"Calculate the similarity to suggest the best matched one...")
+            print_highlighted_text(f"No exact matching of substring '{target_anatomy}' is found!\n"
+                                   f"Calculate the similarity to suggest the best matched one...")
             result = search_with_tolerance()
         elif len(str_found) == 1:
             print(f"Found targeted anatomy by substring matching: '{str_found[0]}'!")
@@ -629,8 +625,8 @@ def inquire_target_in_graph(data_graph: nx.classes.multidigraph.MultiDiGraph, ta
                 result = str_found
                 print('Found substring-matched anatomies:\n\t' + '\n\t'.join(result))
             else:
-                util.print_highlighted_text(f"More than one match of substring {target_anatomy} are found!\n"
-                                            f"Calculate the similarity to suggest the best matched one...")
+                print_highlighted_text(f"More than one match of substring {target_anatomy} are found!\n"
+                                       f"Calculate the similarity to suggest the best matched one...")
                 result = search_with_tolerance()
     else:
         print(f"Found targeted anatomy: '{str_found[0]}'!")
@@ -848,7 +844,7 @@ def set_hierarchic_bin_width(data_dict: dict, data_graph: nx.classes.multidigrap
         predefined_subgroups = ['vasculature', 'muscle', 'gastrointestinal']
     group_dict = get_selected_group_dict(predefined_subgroups)
     tissue_types = [k for k, v in data_dict.items() if isinstance(v, dict)]
-    dict_bin_width = util.NestedDict()
+    dict_bin_width = NestedDict()
 
     for _type in tissue_types:
         if _type == 'Lung':
@@ -882,13 +878,6 @@ def set_hierarchic_bin_width(data_dict: dict, data_graph: nx.classes.multidigrap
             for _subtype in dict_bin_width[_type].keys():
                 print(f'Bin width for {_subtype} of {_type}: {dict_bin_width[_type][_subtype]}')
     return dict_bin_width
-
-
-def set_color_labels_for_display(cls_map: dict):
-    num_labels = len(cls_map)
-    colors = util.set_colors(num_labels)
-    dict_colors = {k: colors[i, :] for i, k in enumerate(cls_map.keys())}
-    return dict_colors
 
 
 def vertebrae_compression_detection_via_auto_landmarks(mask_3d: np.ndarray, y_index: Union[int, None] = None,
@@ -970,7 +959,7 @@ def visualize_vertebrae_with_mask_and_landmarks(img_3d: np.ndarray, mask_3d: np.
                 centroid = np.mean(dict_results[obj]['BBox'], axis=0)
                 ax.text(centroid[0]-5, centroid[1]+2, grade, c='r')
         else:
-            util.print_highlighted_text(f'Mask for {obj} is at {list(dict_results[obj].values())[0]} border')
+            print_highlighted_text(f'Mask for {obj} is at {list(dict_results[obj].values())[0]} border')
     if save_file_name is not None:
         fig.savefig(save_file_name)
 
@@ -1005,4 +994,19 @@ def modify_subcomponent_labels(mask_a: np.ndarray, mask_b: np.ndarray, cls_map_n
     return mask_a_updated
 
 
+def get_task_names_from_target_config(target_config: NestedDict):
+    tasks_cand = segmentation_settings.keys()
+    return [_k for _k in target_config.keys() if _k in tasks_cand]
+
+
+def batch_seg_to_nii_images(dir_input, target_config: NestedDict, coarse: Union[bool, None] = None,
+                            remove_bed: Union[bool, None] = None):
+    nifti_images = get_files_in_folder(dir_input, 'nii.gz', 'seg', False)
+    tasks = get_task_names_from_target_config(target_config)
+    for _file in nifti_images:
+        if remove_bed:
+            _ = remove_bed_with_model(_file)
+        for _t in tasks:
+            seg_config = get_seg_config_by_task_name(_t, coarse)
+            _ = perform_segmentation_generic(_file, seg_config)
 
