@@ -8,8 +8,8 @@ from scipy import ndimage as ndi
 from loggerConfig import logger
 from skimage.measure import find_contours
 from util import NestedDict, print_highlighted_text
-from volStandardizer_reg import get_lb_bright_objects
 from simpleStats import get_index_of_plane_with_largest_mask_area
+from segModel import get_bright_objects, get_hip_prosthesis
 from segModel import remove_segments_with_size_limit, get_v_dependent_cls_map
 from simpleGeometry import get_2d_oriented_bbox_from_mask, get_side_from_closed_curve, get_2d_bool_mask_boundary_points
 
@@ -345,8 +345,13 @@ def prosthesis_detection_at_lower_bound(img_3d: np.ndarray, obj_ref: dict, plot_
     z_max = img_3d.shape[2]
     if lower_bound >= 0:
         img_cor_cropped = np.flipud(np.max(img_3d[:, :, lower_bound:], axis=0).T)
-        seg_labeled, seg_prosthesis = get_lb_bright_objects(img_cor_cropped)
-        prosthesis_detected = 0 if np.isscalar(seg_prosthesis) else 1
+        seg_labeled = get_bright_objects(img_cor_cropped)
+        if np.isscalar(seg_labeled):
+            prosthesis_detected = 0
+            seg_prosthesis = -1
+        else:
+            seg_prosthesis = get_hip_prosthesis(seg_labeled)
+            prosthesis_detected = 0 if np.isscalar(seg_prosthesis) else 1
         if prosthesis_detected:
             if dataset_tag is not None:
                 add_tag_to_data(dataset_tag, 'prosthesisDetected', data_id, 'Warning')
@@ -375,7 +380,7 @@ def prosthesis_detection_at_lower_bound(img_3d: np.ndarray, obj_ref: dict, plot_
                                                                       return_fig=True, vmax=int_max,
                                                                       aspect=aspect_ratios[2])
         else:
-            seg_labeled, _ = get_lb_bright_objects(img_cor)
+            seg_labeled = get_bright_objects(img_cor)
             if not np.isscalar(seg_labeled):
                 int_max = np.percentile(img_cor[~seg_labeled.astype(np.bool_)], 99.5)
             else:
