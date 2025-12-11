@@ -20,7 +20,6 @@ from skimage.segmentation import watershed
 from skimage.filters import threshold_multiotsu
 from skimage.measure import regionprops
 from totalsegmentator import nnunet
-from genericImageIO import dicom_to_nifti
 from totalsegmentator import postprocessing
 from totalsegmentator.resampling import resample_img
 from totalsegmentator.map_to_binary import class_map
@@ -425,6 +424,32 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
             data[cleaned_roi] = _label  # Write back the cleaned ROI into data
         return data
 
+    # noinspection SpellCheckingInspection
+    def _dicom_to_nifti(input_path, output_path: Union[str, Path]):
+        # Modified from TotalSegmentator's implementation. Can be replaced by the function from dicomParser
+        from totalsegmentator.dicom_io import command_exists, download_dcm2niix
+        import platform
+        """
+        input_path: a directory of dicom slices
+        output_path: a nifti file path
+        """
+        if isinstance(output_path, str):
+            output_path = Path(output_path)
+
+        config_dir = Path(os.environ["TOTALSEG_WEIGHTS_PATH"]) / "nnUNet"
+        if command_exists("dcm2niix"):
+            dcm2niix = "dcm2niix"
+        else:
+            if platform.system() == "Windows":
+                dcm2niix = config_dir / "dcm2niix.exe"
+            else:
+                dcm2niix = config_dir / "dcm2niix"
+            if not dcm2niix.exists():
+                download_dcm2niix()
+        output_file_no_ext = output_path.name.split('.')[0]
+        subprocess.call(f'"{dcm2niix}" -o "{output_path.parent}" -z y -f "{output_file_no_ext}" "{input_path}"')
+        os.remove(os.path.join(output_path.parent, output_file_no_ext + ".json"))
+    
     if isinstance(file_in, (str, Path)):
         if isinstance(file_in, Path):
             str_file_in = str(file_in)
@@ -457,7 +482,7 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
             if not quiet:
                 print("Converting dicom to nifti...")
             (tmp_dir / "dcm").mkdir()  # make subdir otherwise this file would be included by nnUNet_predict
-            dicom_to_nifti(file_in, tmp_dir / "dcm" / "converted_dcm.nii.gz")
+            _dicom_to_nifti(file_in, tmp_dir / "dcm" / "converted_dcm.nii.gz")
             file_in_dcm = file_in
             file_in = tmp_dir / "dcm" / "converted_dcm.nii.gz"
             if not quiet:
@@ -972,8 +997,35 @@ def get_object_width_at_bottom(mask_2d: NDArray[np.bool_], position=0.2):
     return thickness_median
 
 
-def get_lb_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_threshold=200, prosthesis_min=1000,
-                           show_image=False, file_path=''):
+def get_hip_prosthesis(seg_labeled_objs, size_lb=1000):
+    seg_labeled_at_border = get_objects_at_border(seg_labeled_objs, selected_border='low')
+    props = regionprops(seg_labeled_at_border)
+    if len(props) >= 1:
+        seg_labeled_prosthesis = seg_labeled_at_border.copy()
+        seg_prosthesis_num = 0
+        for i in range(len(props)):
+            seg_labeled_region = np.asarray(seg_labeled_prosthesis == props[i].label)
+            obj_width = get_object_width_at_bottom(seg_labeled_region)
+            if props[i].area > size_lb and obj_width > 10:
+                print('Detected prosthesis with label of {} has a median width of {}'.format(props[i].label,
+                                                                                             obj_width))
+                seg_prosthesis_num += 1
+            else:
+                seg_labeled_prosthesis[seg_labeled_region] = 0
+        if seg_labeled_prosthesis.max() == 0:
+            seg_labeled_prosthesis = -1
+        else:
+            print('{} detected hip prosthesis with sizes larger than {}!'.format(seg_prosthesis_num,
+                                                                                 size_lb))
+    else:
+        seg_labeled_prosthesis = -1
+
+    return seg_labeled_prosthesis
+
+
+# noinspection SpellCheckingInspection
+def get_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_threshold=200, show_image=False,
+                       file_path=''):
 
     def show_image_seg(images_subplot, title_subplots, aspect_ratio):
         figure, axs = plt.subplots(1, len(images_subplot), layout='constrained')
@@ -988,45 +1040,20 @@ def get_lb_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_
         if file_path:
             figure.savefig(os.path.join(file_path, patient_id + '_detected_bright_objects.png'))
 
-    def get_hip_prosthesis(seg_labeled_implants, size_threshold=prosthesis_min):
-        seg_labeled_at_border = get_objects_at_border(seg_labeled_implants, selected_border='low')
-        props = regionprops(seg_labeled_at_border)
-        if len(props) >= 1:
-            seg_labeled_prosthesis = seg_labeled_at_border.copy()
-            seg_prosthesis_num = 0
-            for i in range(len(props)):
-                seg_labeled_region = np.asarray(seg_labeled_prosthesis == props[i].label)
-                obj_width = get_object_width_at_bottom(seg_labeled_region)
-                if props[i].area > size_threshold and obj_width > 10:
-                    print('Detected prosthesis with label of {} has a median width of {}'.format(props[i].label,
-                                                                                                 obj_width))
-                    seg_prosthesis_num += 1
-                else:
-                    seg_labeled_prosthesis[seg_labeled_region] = 0
-            if seg_labeled_prosthesis.max() == 0:
-                seg_labeled_prosthesis = -1
-            else:
-                print('{} detected hip prosthesis with sizes larger than {}!'.format(seg_prosthesis_num,
-                                                                                     size_threshold))
-        else:
-            seg_labeled_prosthesis = -1
-
-        return seg_labeled_prosthesis
-
-    def determine_what_to_plot(seg, seg_at_border):
-        disp_seg = True
-        disp_seg_at_border = False
-        if isinstance(seg_at_border, int) is False:
-            prop_seg = regionprops(seg)
-            prop_seg_border = regionprops(seg_at_border)
-            if len(prop_seg_border) > 0:
-                if len(prop_seg_border) == len(prop_seg):
-                    disp_seg = False
-                    disp_seg_at_border = True
-                else:
-                    disp_seg = True
-                    disp_seg_at_border = True
-        return disp_seg, disp_seg_at_border
+    # def determine_what_to_plot(seg, seg_at_border):
+    #     disp_seg = True
+    #     disp_seg_at_border = False
+    #     if isinstance(seg_at_border, int) is False:
+    #         prop_seg = regionprops(seg)
+    #         prop_seg_border = regionprops(seg_at_border)
+    #         if len(prop_seg_border) > 0:
+    #             if len(prop_seg_border) == len(prop_seg):
+    #                 disp_seg = False
+    #                 disp_seg_at_border = True
+    #             else:
+    #                 disp_seg = True
+    #                 disp_seg_at_border = True
+    #     return disp_seg, disp_seg_at_border
 
     img_seg = segment_bright_objects(img_2d, area_threshold)
     # To remove possible dark objects in the segmented image, additional segmentation operation is therefore computed.
@@ -1040,22 +1067,25 @@ def get_lb_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_
                 img_title_ori = '%03d: ' % idx_patient + patient_id
             else:
                 img_title_ori = 'Original coronal view'
-            display_seg, display_prosthesis = determine_what_to_plot(seg_labeled, seg_prosthesis)
-            if display_seg is True and display_prosthesis is True:
-                img_disp = [img_2d, seg_labeled, seg_prosthesis]
-                img_title = [img_title_ori, 'Detected bright objects', 'Hip prosthesis']
-                show_image_seg(img_disp, img_title, aspect)
-            elif display_seg is True and display_prosthesis is False:
-                img_disp = [img_2d, seg_labeled]
-                img_title = [img_title_ori, 'Detected bright objects']
-                show_image_seg(img_disp, img_title, aspect)
-            elif display_seg is False and display_prosthesis is True:
-                img_disp = [img_2d, seg_prosthesis]
-                img_title = [img_title_ori, 'Hip prosthesis']
-                show_image_seg(img_disp, img_title, aspect)
+            img_disp = [img_2d, seg_labeled]
+            img_title = [img_title_ori, 'Detected bright objects']
+            show_image_seg(img_disp, img_title, aspect)
+            # display_seg, display_prosthesis = determine_what_to_plot(seg_labeled, seg_prosthesis)
+            # if display_seg is True and display_prosthesis is True:
+            #     img_disp = [img_2d, seg_labeled, seg_prosthesis]
+            #     img_title = [img_title_ori, 'Detected bright objects', 'Hip prosthesis']
+            #     show_image_seg(img_disp, img_title, aspect)
+            # elif display_seg is True and display_prosthesis is False:
+            #     img_disp = [img_2d, seg_labeled]
+            #     img_title = [img_title_ori, 'Detected bright objects']
+            #     show_image_seg(img_disp, img_title, aspect)
+            # elif display_seg is False and display_prosthesis is True:
+            #     img_disp = [img_2d, seg_prosthesis]
+            #     img_title = [img_title_ori, 'Hip prosthesis']
+            #     show_image_seg(img_disp, img_title, aspect)
     else:
         seg_labeled = -1
-        seg_prosthesis = -1
+        # seg_prosthesis = -1
         if show_image is True:
             if (not patient_id) and (idx_patient != -1):
                 img_title = '%03d: ' % idx_patient + patient_id
@@ -1067,9 +1097,5 @@ def get_lb_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_
             ax.set_title(img_title)
             fig.show()
 
-    return seg_labeled, seg_prosthesis
-
-
-
-
+    return seg_labeled
 
