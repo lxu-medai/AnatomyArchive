@@ -9,23 +9,19 @@ import numpy as np
 import nibabel as nib
 import matplotlib
 import matplotlib.pyplot as plt
-from scipy import ndimage
 from tqdm import tqdm
 from pathlib import Path
 from scipy import ndimage as ndi
-from typing import Union, List
 from numpy.typing import NDArray
-from skimage import filters
-from skimage.segmentation import watershed
-from skimage.filters import threshold_multiotsu
+from typing import Union, List
 from skimage.measure import regionprops
+from skimage.filters import farid, threshold_multiotsu
 from totalsegmentator import nnunet
 from totalsegmentator import postprocessing
 from totalsegmentator.resampling import resample_img
 from totalsegmentator.map_to_binary import class_map
-from genericImageIO import convert_nifti_to_numpy
-from util import print_highlighted_text, normalized_image_to_8bit
 from skimage.morphology import disk, remove_small_objects, skeletonize
+from util import print_highlighted_text, normalized_image_to_8bit, segment_bright_objects_init
 
 
 v_totalsegmentator = None
@@ -41,10 +37,14 @@ def get_segmentator_version():
         from totalsegmentator.config import setup_nnunet
         setup_nnunet()
         import importlib
+        from nnunet import paths
+        importlib.reload(paths)
+        importlib.reload(nnunet)
+        print(f'Configured directory for TotalSegmentator models: {paths.network_training_output_dir}')
         # noinspection PyUnresolvedReferences
         v_str = importlib.metadata.distribution('totalsegmentator').version
-        print(f'Installed TotalSegmentator version: {v_str}')
         v_totalsegmentator = int(v_str.split('.')[0])
+    print(f'Installed TotalSegmentator version: {v_str}')
 
 
 get_segmentator_version()
@@ -183,7 +183,10 @@ def image_resample(data: Union[np.ndarray, nib.nifti1.Nifti1Image], voxel_size: 
         is_array = False
         affine_new = np.copy(data.affine)
         _dtype = data.get_data_dtype()
-        data, voxel_size = convert_nifti_to_numpy(data)
+        # noinspection PyUnresolvedReferences
+        voxel_size = data.header.get_zooms()
+        data = data.get_fdata().astype(_dtype)
+        # data, voxel_size = convert_nifti_to_numpy(data)
 
     if target_voxel_size is None:
         # Take voxel size on x axis
@@ -341,8 +344,9 @@ def check_mask_file_and_load(file_in: str, seg_config: dict):
     if not os.path.isfile(file_mask):
         mask = perform_segmentation_generic(file_in, seg_config, return_numpy=True)
     else:
+        mask = nib.load(file_mask)
         # noinspection PyTypeChecker
-        mask, *_ = convert_nifti_to_numpy(nib.load(file_mask))
+        # mask, *_ = convert_nifti_to_numpy(nib.load(file_mask))
     return mask
 
 
@@ -768,8 +772,8 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
 
 
 # noinspection SpellCheckingInspection
-def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bool = True,
-                                 return_numpy: bool = False,) -> Union[nib.Nifti1Image, np.ndarray]:
+def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bool = True)\
+        -> Union[nib.Nifti1Image, np.ndarray]:
     # For the time being, it is not recommended to save segmentation results after postfix directly as more
     # sub-functions will be added to improve the postfix method.
     """
@@ -777,7 +781,6 @@ def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bo
     :param seg_config: a dict that contains information about 'task_id', 'trainer', 'voxel_size', 'crop' and might
                        include 'crop_addon' as well;
     :param save_output: bool on whether to save the output image;
-    :param return_numpy: return segmentation result as numpy array or as a nifti image;
     :return: result: either as an image in nifti format or as a numpy array
     """
     file_out = set_seg_file_name(file_in, seg_config)
@@ -799,36 +802,33 @@ def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bo
             nib.save(result, file_out)
     else:
         result = nib.load(file_out)
-    if return_numpy:
-        result, *_ = convert_nifti_to_numpy(result)
     return result
 
 
-def remove_bed_with_model(file_image: str, save_output: bool = True, return_numpy: bool = False):
+def remove_bed_with_model(file_image: str, save_output: bool = True):
     seg_config = get_seg_config_by_task_name('body')
     image_arr_body = perform_segmentation_generic(file_image, seg_config, save_output=save_output, return_numpy=True)
     img_nii = nib.load(file_image)
-    # noinspection PyTypeChecker
-    image_arr, affine, _ = convert_nifti_to_numpy(img_nii)
+    # noinspection PyUnresolvedReferences
+    image_arr = img_nii.get_fdata().astype(np.int16)
+    # noinspection PyUnresolvedReferences
+    affine = img_nii.affine
     mask_other = image_arr_body == 0
     image_arr[mask_other] = image_arr.min()
-    if return_numpy:
-        return image_arr
-    else:
-        img_nii_new = nib.Nifti1Image(image_arr, affine)
-        if save_output:
-            nib.save(img_nii_new, file_image)
-        return img_nii_new
+    img_nii_new = nib.Nifti1Image(image_arr, affine)
+    if save_output:
+        nib.save(img_nii_new, file_image)
+    return img_nii_new
 
 
-def remove_bed_with_scipy(img_3d: np.ndarray, threshold=-50, struct_size=(15, 15), fill_value=-1024):
+def remove_bed_with_scipy(img_3d: np.ndarray, threshold=-50, struct_size=(15, 15), fill_value=None):
     img_axial = np.max(img_3d, axis=2)
     img_axial[img_axial > threshold] = 1
     img_axial[img_axial <= threshold] = 0  # fill_value
     img_axial = (ndimage.binary_opening(img_axial, structure=np.ones(struct_size))).astype(int)
     mask_body = np.repeat(img_axial[:, :, np.newaxis], repeats=img_3d.shape[2], axis=2)
     _img = img_3d.copy()
-    _img[mask_body == 0] = fill_value
+    _img[mask_body == 0] = fill_value if fill_value is not None else np.min(img_3d)
     return _img
 
 
@@ -867,23 +867,6 @@ def remove_segments_with_size_limit(img: np.ndarray, dict_size_limit: Union[dict
         if len(counts) == 0:
             print_highlighted_text('Input mask image is blank!')
         return img
-
-
-def segment_bright_objects_init(img_2d):
-    # Use edge enhancing filter as an initial step to segment bright objects
-    img_mag_farid = filters.farid(img_2d)
-    # noinspection PyTypeChecker
-    markers = np.zeros_like(img_mag_farid)
-    markers[img_2d < 900] = 1
-    # noinspection PyTypeChecker
-    markers[img_mag_farid > 120 / np.iinfo(img_2d.dtype).max] = 2
-    img_seg = watershed(img_mag_farid, markers)
-    # In most cases the following two lines are enough to segment out bright objects. However, because gradient-based
-    # methods detect also edges of dark objects in the neighborhood of bright objects, 'fill hole' operation will
-    # probably get part of dark objects in the returned segmentations. This is why this method is only the initial step.
-    img_seg = ndi.binary_fill_holes(img_seg - 1)
-    img_seg = ndi.binary_opening(img_seg, disk(2))
-    return img_seg
 
 
 def segment_bright_objects(img_2d, area_threshold=200):
@@ -1098,4 +1081,5 @@ def get_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_thr
             fig.show()
 
     return seg_labeled
+
 
