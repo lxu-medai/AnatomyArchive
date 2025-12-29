@@ -1,24 +1,24 @@
-import operator
-import numpy as np
-from typing import Union
-import volumeViewerMPL
+from segManager import *
 from functools import reduce
 import matplotlib.pyplot as plt
 from scipy import ndimage as ndi
 from loggerConfig import logger
 from skimage.measure import find_contours
-from util import NestedDict, print_highlighted_text
+from genericImageIO import convert_nifti_to_numpy
 from simpleStats import get_index_of_plane_with_largest_mask_area
-from segModel import get_bright_objects, get_hip_prosthesis
-from segModel import remove_segments_with_size_limit, get_v_dependent_cls_map
+from util import NestedDict, print_highlighted_text, get_files_in_folder, get_largest_subset
+from segModel import get_bright_objects, get_hip_prosthesis, remove_segments_with_size_limit
 from simpleGeometry import get_2d_oriented_bbox_from_mask, get_side_from_closed_curve, get_2d_bool_mask_boundary_points
 
 
 def add_tag_to_data(dataset_tag: NestedDict, tag: str, data_id: str, tag_type: str = 'Error'):
-    if tag not in dataset_tag[tag_type].keys():
-        dataset_tag[tag_type][tag] = list()
-    if data_id not in dataset_tag[tag_type][tag]:
-        dataset_tag[tag_type][tag].append(data_id)
+    if data_id is not None:
+        if tag not in dataset_tag[tag_type].keys():
+            dataset_tag[tag_type][tag] = list()
+        if data_id not in dataset_tag[tag_type][tag]:
+            dataset_tag[tag_type][tag].append(data_id)
+    else:
+        dataset_tag[tag_type]['DatasetLevel'] = tag
 
 
 def get_object_area_at_indexed_plane(_mask: Union[np.ndarray, bool], voxel_size: Union[tuple, list, np.ndarray],
@@ -88,6 +88,53 @@ def set_central_ref_plane(img_3d: np.ndarray, mask_3d: np.ndarray, voxel_size: U
         else:
             plt.show()
 
+
+def set_backbone_bounds_for_dataset(dir_input, data_specs: NestedDict, thresh: int = 95,
+                                    dataset_tag: Union[NestedDict, None] = None):
+    nifti_images = get_files_in_folder(dir_input, 'nii.gz', 'seg', False)
+    seg_config = get_seg_config_by_task_name('total')
+    cls_map = get_cls_map_for_backbones()
+    cls_map_rev = {_v: _k for _k, _v in cls_map.items()}
+    lst_sets = list()
+    for _file in nifti_images:
+        mask_3d = convert_nifti_to_numpy(perform_segmentation_generic(os.path.join(dir_input, _file), seg_config))
+        patient_id = _file.split('_')[0]
+        labels = np.unique(mask_3d[mask_3d > 0])
+        bones_found = [_v for _k, _v in cls_map.items() if _k in labels]
+        bones_sorted = sort_backbones_top_to_bottom(bones_found)
+        try:
+            bones_at_bounds = get_top_and_bottom_backbones(bones_sorted, True)
+        except ValueError:
+            if 'Excluded' not in data_specs.keys():
+                data_specs['Excluded']['MissingBounds'] = list()
+            data_specs['Excluded']['MissingBounds'].append(patient_id)
+            if dataset_tag is not None:
+                add_tag_to_data(dataset_tag, 'MissingBounds', patient_id)
+            continue
+        labels_at_bounds = [cls_map_rev[_s] for _s in bones_at_bounds]
+        # INSTEAD OF COMPUTING IT FOR EVERY LISTED BONES, CHECK ONLY THE UPMOST AND BOTTOM BONES.
+        # Check whether each label correspondent mask is fully covered in the scan (in coronal view) or not.
+        flags_cropped = [_l for _l in labels_at_bounds if simpleGeometry.is_2d_bool_mask_at_boundary(
+            np.flipud(np.max(mask_3d == _l, axis=0).T))]
+        idx_ub = bones_sorted.index(bones_at_bounds[0]) + 1 if flags_cropped[0] else \
+            bones_sorted.index(bones_at_bounds[0])
+        idx_lb = bones_sorted.index(bones_at_bounds[1]) - 1 if flags_cropped[1] else \
+            bones_sorted.index(bones_at_bounds[1])
+        data_specs[patient_id]['Torso_UB'] = bones_sorted[idx_ub]
+        data_specs[patient_id]['Torso_LB'] = bones_sorted[idx_lb]
+        set_torso_bones = set(bones_sorted[idx_ub:idx_lb+1])
+        lst_sets.append(set_torso_bones)
+    bones_common = get_largest_subset(lst_sets, thresh)
+    try:
+        bounds = get_top_and_bottom_backbones(list(bones_common))
+    except ValueError:
+        if dataset_tag is not None:
+            add_tag_to_data(dataset_tag, 'TooStrictThreshold')
+        return lst_sets
+    else:
+        obj_ref = {'UB': bounds[0], 'LB': bounds[1]}
+        return lst_sets, obj_ref
+        
 
 # noinspection SpellCheckingInspection
 def define_volume_bounds_by_objects(img_3d_seg: np.ndarray, obj_ref: dict, cls_map_name: str = 'total',
@@ -376,17 +423,16 @@ def prosthesis_detection_at_lower_bound(img_3d: np.ndarray, obj_ref: dict, plot_
             mask = np.zeros_like(img_cor)
             mask[:z_max - lower_bound:, :] = seg_prosthesis
             dict_colors = {1: (1, 1, 0)}
-            fig, ax = volumeViewerMPL.show_mask_superimposed_2d_image(img_cor, mask, dict_colors,
-                                                                      return_fig=True, vmax=int_max,
-                                                                      aspect=aspect_ratios[2])
+            fig, ax = show_mask_superimposed_2d_image(img_cor, mask, dict_colors, return_fig=True, vmax=int_max,
+                                                      aspect=aspect_ratios[2])
         else:
             seg_labeled = get_bright_objects(img_cor)
             if not np.isscalar(seg_labeled):
                 int_max = np.percentile(img_cor[~seg_labeled.astype(np.bool_)], 99.5)
             else:
                 int_max = np.percentile(img_cor, 99.5)
-            fig, ax = volumeViewerMPL.get_sectional_view_image(img_3d, 'x', window_image=None, return_fig=True,
-                                                               aspect=aspect_ratios[2], vmax=int_max)
+            fig, ax = get_sectional_view_image(img_3d, 'x', window_image=None, return_fig=True,
+                                               aspect=aspect_ratios[2], vmax=int_max)
         if lower_bound >= 0:
             ax.plot(range(img_cor.shape[1]), [z_max - lower_bound] * img_cor.shape[1], 'g-', alpha=0.5, linewidth=3)
         elif lower_bound == -2 and img_3d_seg_ref is None:
@@ -431,9 +477,8 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
                            cls_map_ref: Union[dict, str, None] = None, obj_ref: Union[dict, None] = None,
                            all_within_bounds: [bool, None] = None, leg_norm_dist_std: Union[float, None] = None,
                            body_cropping_detection: bool = False, plot_image: bool = False,
-                           voxel_size: Union[tuple, np.ndarray, list, None] = None,
-                           img_3d: Union[np.ndarray, None] = None, save_fig_name: Union[str, None] = None,
-                           data_id: Union[str, None] = None, dataset_tag: Union[NestedDict, None] = None):
+                           save_fig_name: Union[str, None] = None, data_id: Union[str, None] = None,
+                           dataset_tag: Union[NestedDict, None] = None, **kwargs):
 
     """
     :param img_3d_seg_body: numpy array of segmentation result from TotalSegmentator after running task 'body'.
@@ -461,16 +506,18 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
                               is that the uppersides of the arms are much closer to the upperboundary of the
     :param body_cropping_detection: bool on whether to detect if the body is cropped.
     :param plot_image: bool on whether to plot the image as control for manual inspection later.
-    :param voxel_size: a list, numpy array or a tuple of 3 elements. It is only needed if image will be plotted.
-    :param img_3d: 3D image array. Needed only if plot_image is set to True.
     :param save_fig_name: save the figure without showing if a string is provided. Otherwise, show the result.
     :param data_id: str or None. It is useful for logging especially if it is used for deselection of images.
     :param dataset_tag: NestedDict or None. It is useful for logging and accumulating deselected the image data and the
                         reasons.
+    :param kwargs: addition parameters:
+                   buffer_dist: cropping detection or checking if an object is at the bottom, default: 1
+                   img_3d: 3D image array. Needed only if plot_image is set to True.
+                   woxel_size: a list, numpy array or a tuple of 3 elements. It is only needed if image will be plotted.
     :return: mask_arms: dict of bool numpy array of arms that may contain keywords of 'LeftArm' or 'RightArm' or both.
     """
 
-    def is_seg_at_bottom(buffer_dist=1):
+    def is_seg_at_bottom():
         arr_z = np.zeros(num_ext + 1)
         for _i in range(1, num_ext + 1):
             _mask = mask_ext_labeled == _i
@@ -478,13 +525,12 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
         return arr_z < buffer_dist
 
     def _detect_body_cropping(_plane: str = 'cor'):
-        atol = 1
         nonlocal flag_body_cropped
         if _plane == 'cor':
             _mask_body_2d = np.flipud(np.max(mask_body_selected, axis=0).T)
         else:  # _plane == 'axi'
             _mask_body_2d = np.max(mask_body_selected, axis=2)
-        _dict_bounds = get_2d_bool_mask_boundary_points(_mask_body_2d, atol)
+        _dict_bounds = get_2d_bool_mask_boundary_points(_mask_body_2d, buffer_dist)
         if isinstance(_dict_bounds, dict):
             if _plane == 'cor':
                 if len(_dict_bounds[2]) > 0 or len(_dict_bounds[4]) > 0:
@@ -495,6 +541,8 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
                 flag_body_cropped = 2
 
         return _dict_bounds
+
+    buffer_dist = kwargs.get('buffer_dist', 1)
     if (obj_ref is not None) and (all_within_bounds is True):
         mask_body = img_3d_seg_body[:, :, obj_ref['LB']['boundPlane']: obj_ref['UB']['boundPlane']]
     else:
@@ -590,6 +638,7 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
 
     if not np.isscalar(mask_arms):
         if dataset_tag is not None:
+            data_id = kwargs.get('data_id', None)
             assert data_id is not None
             add_tag_to_data(dataset_tag, 'armDetected', data_id, 'Warning')
     if body_cropping_detection:
@@ -612,20 +661,17 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
     result['bodyCroppedFlag'] = flag_body_cropped
     plot_image = plot_image or isinstance(save_fig_name, str)
     if plot_image:
+        img_3d = kwargs.get('img_3d', None)
         assert img_3d is not None
-        if voxel_size is None:
-            aspect_ratios = np.array([1, 1, 1])
-        else:
-            if not isinstance(voxel_size, np.ndarray):
-                voxel_size = np.array(voxel_size)
-            aspect_ratios = voxel_size/voxel_size[0]
+        voxel_size = np.array(kwargs.get('voxel_size'), [1, 1, 1])
+        aspect_ratios = voxel_size/voxel_size[0]
         if flag_body_cropped < 2:
-            fig, ax = volumeViewerMPL.get_sectional_view_image(img_3d, 'x', return_fig=True, window_image=None,
-                                                               aspect=aspect_ratios[2])
+            fig, ax = get_sectional_view_image(img_3d, 'x', return_fig=True, window_image=None,
+                                               aspect=aspect_ratios[2])
             mask_2d = np.flipud(np.max(mask_without_arms, axis=0).T)
         else:
-            fig, ax = volumeViewerMPL.get_sectional_view_image(img_3d, 'z', return_fig=True, window_image=None,
-                                                               aspect=aspect_ratios[2])
+            fig, ax = get_sectional_view_image(img_3d, 'z', return_fig=True, window_image=None,
+                                               aspect=aspect_ratios[2])
             mask_2d = np.max(mask_without_arms, axis=2)
         contours_body = find_contours(mask_2d, 0.5)
         for i, _cnt in enumerate(contours_body):
@@ -649,7 +695,4 @@ def separate_arms_and_legs(img_3d_seg_body: np.ndarray, img_3d_seg_ref: Union[np
             plt.show(block=True)
     return result
 
-
-__all__ = ['add_tag_to_data', 'get_object_area_at_indexed_plane', 'set_central_ref_plane',
-           'define_volume_bounds_by_objects', 'prosthesis_detection_at_lower_bound', 'separate_arms_and_legs']
 
