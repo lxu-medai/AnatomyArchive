@@ -7,7 +7,6 @@ import simpleStats
 import simpleGeometry
 import networkx as nx
 import nibabel as nib
-from scipy import ndimage
 from typing import List, Union
 from functools import reduce
 from genericImageIO import convert_nifti_to_numpy
@@ -47,6 +46,74 @@ def get_preset_anatomy_groups():
     return anatomy_groups
 
 
+def get_cls_map_for_backbones():
+    cls_map = get_v_dependent_cls_map('total')
+    kwd = ['vertebrae', 'sacrum', 'pelvic']
+    return {_k: _v for _k, _v in cls_map.items() if any([_e in _k for _e in kwd])}
+
+
+def sort_backbones_top_to_bottom(bone_names) -> List[str]:
+    """
+        Sort backbones from the top-most to bottom-most.
+        Assumes order: C < T < L < S < Sacrum < Pelvic, and numeric order within category.
+
+        Args:
+            bone_names (list of str): e.g. ['vertebrae_C6', 'vertebrae_T12', 'vertebrae_L4', 'Sacrum']
+
+        Returns:
+            list of strings
+        """
+    # Define category ranking
+    category_order = {
+        'C': 1,
+        'T': 2,
+        'L': 3,
+        'S': 4,
+        'SACRUM': 5,
+        'PELVIC': 6
+    }
+
+    def parse(name):
+        if '_' in name:
+            names = name.split('_')
+            name_cat = names[1]
+        else:
+            name_cat = name
+        name_cat = name_cat.upper()
+        # Handle special names
+        if name_cat in ('SACRUM', 'PELVIC'):
+            return category_order[name_cat], 0
+        # Extract letter prefix and number
+        prefix = ''.join([ch for ch in name_cat if ch.isalpha()])
+        digits = ''.join([ch for ch in name_cat if ch.isdigit()])
+        num = int(digits) if digits else 0
+        return category_order.get(prefix, 999), num
+
+    # Sort by category then number
+    return sorted(bone_names, key=parse)
+
+
+def get_top_and_bottom_backbones(bone_names: List[str], is_sorted: bool = False):
+    """
+        Determine the top-most and bottom-most backbones from a list of names.
+        Assumes order: C < T < L < S < Sacrum < Pelvic, and numeric order within category.
+
+        Args:
+            bone_names (list of str): e.g. ['vertebrae_C6', 'vertebrae_T12', 'vertebrae_L4', 'Sacrum']
+            is_sorted: bool on whether the bone names have already been sorted from top to bottom, default: False
+        Returns:
+            (top, bottom): tuple of strings
+    """
+    if len(bone_names) < 2:
+        raise ValueError('Input list must at least have two elements!')
+
+    if not is_sorted:
+        sorted_names = sort_backbones_top_to_bottom(bone_names)
+    else:
+        sorted_names = bone_names
+    return sorted_names[0], sorted_names[-1]
+
+
 def get_liver_associated_anatomy_and_kwd() -> dict:
     return {'liv': 'liver', 'psv': 'portal_vein_and_splenic_vein', 'ivc': 'inferior_vena_cava'}
 
@@ -78,58 +145,6 @@ def get_selected_group_dict(selected_group: Union[str, list, None] = None) -> di
     else:
         _get_members(selected_group)
     return group_dict
-
-
-def download_totalsegmentator_pretrained_weights_with_license(config_file: dict, task_name):
-    import time
-    import sys
-    import requests
-    from tqdm import tqdm
-    import zipfile
-    from util import decode_string
-
-    # It is important that the license number should be removed from the code prior to publication!!!
-    license_number = decode_string(config_file['LicenseNumber'])
-    config_dir = os.environ['RESULTS_FOLDER']
-    assert config_dir is not None
-    temp_file = os.path.join(config_dir, "tmp_download_file.zip")
-    url = "http://backend.totalsegmentator.com:80/"
-
-    # Download
-    try:
-        st = time.time()
-        r = requests.post(url + "download_weights",
-                          json={"license_number": license_number,
-                                "task": task_name},
-                          timeout=300,
-                          stream=True)
-        r.raise_for_status()  # Raise an exception for HTTP errors (4xx, 5xx)
-
-        if r.ok:
-            with open(temp_file, "wb") as f:
-                total_size = int(r.headers.get('content-length', 0))
-                progress_bar = tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading")
-                for chunk in r.iter_content(chunk_size=8192 * 16):
-                    progress_bar.update(len(chunk))
-                    f.write(chunk)
-                progress_bar.close()
-
-            print("Download finished. Extracting...")
-            with zipfile.ZipFile(temp_file, 'r') as zip_f:
-                zip_f.extractall(config_dir)
-            print(f"  downloaded in {time.time() - st:.2f}s")
-        else:
-            if r.json()['status'] == "invalid_license":
-                print(
-                    f"ERROR: Invalid license number ({license_number}). "
-                    f"Please check your license number or contact support.")
-                sys.exit(1)
-
-    except Exception as e:
-        raise e
-    finally:
-        if os.path.isfile(temp_file):
-            os.remove(temp_file)
 
 
 def get_default_tissue_hu_range():
@@ -190,18 +205,6 @@ def split_nii_filename(nii_filename: str):
     # Get the segment name before the 'seg' keyword.
     idx_segment = strs.index('seg') - 1
     return strs, idx_segment, str_ext
-
-
-def get_largest_component(mask: np.ndarray):
-    if mask.dtype == np.bool_:
-        seg_labeled, seg_num = ndimage.label(mask)
-    else:
-        seg_labeled = mask
-        seg_num = len(np.unique(mask[mask > 0]))
-    size_arr = np.zeros(seg_num)
-    for i in range(seg_num):
-        size_arr[i] = np.sum(seg_labeled == i + 1)
-    return seg_labeled == np.argmax(size_arr) + 1
 
 
 def segmentation_postfix(img_3d: np.ndarray, img_3d_seg: np.ndarray, task_name: str, mask_dict: dict,
@@ -1009,4 +1012,5 @@ def batch_seg_to_nii_images(dir_input, target_config: NestedDict, coarse: Union[
         for _t in tasks:
             seg_config = get_seg_config_by_task_name(_t, coarse)
             _ = perform_segmentation_generic(_file, seg_config)
+
 
