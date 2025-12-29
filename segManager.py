@@ -883,90 +883,6 @@ def set_hierarchic_bin_width(data_dict: dict, data_graph: nx.classes.multidigrap
     return dict_bin_width
 
 
-def vertebrae_compression_detection_via_auto_landmarks(mask_3d: np.ndarray, y_index: Union[int, None] = None,
-                                                       slab_hw: Union[int, None] = None, smooth_contour: bool = False):
-    def get_vertebral_grade_type(_dists):
-        height_reduction = (np.max(_dists) - np.min(_dists)) / np.max(_dists)
-        if 0.2 <= np.round(height_reduction, 2) <= 0.25:
-            _grade = 1
-        elif np.round(height_reduction, 2) >= 0.26 and height_reduction <= 0.4:
-            _grade = 2
-        elif height_reduction > 0.4:
-            _grade = 3
-        else:
-            _grade = 0
-        if _grade > 0:
-            if np.argmin(_dists) == 0:
-                _grade_type = 'W'
-            elif np.argmin(_dists) == 1:
-                _grade_type = 'B'
-            else:
-                _grade_type = 'C'
-            _grade_type += str(_grade)
-        else:
-            _grade_type = 0
-        return _grade_type
-    mask_2d = get_sectional_view_image(mask_3d, 'y', slice_idx=y_index, slab_hw=slab_hw, is_mask=True,
-                                       plot_figure=False)
-    cls_map = class_map['total_v2']
-    cls_map_vert = {k: v for k, v in cls_map.items() if ('e_L' in v) or ('_T12' in v)}
-    # dict_colors = set_color_labels_for_display(cls_map_vert)
-    labels = set(np.unique(mask_2d[mask_2d > 0]))
-    dict_results = dict()
-    for _l in labels:
-        _dict = simpleGeometry.mask_bbox_dists_with_midpoints(mask_2d, _l, smooth_contour)
-        if 'BBox' in _dict.keys():
-            grade = get_vertebral_grade_type(_dict['Distances'])
-            dict_results[cls_map_vert[_l]] = {'BBox': _dict['BBox'], 'Grade': grade, 'Landmarks': _dict['Landmarks']}
-        else:
-            dict_results[cls_map_vert[_l]] = _dict
-    return dict_results
-
-
-def visualize_vertebrae_with_mask_and_landmarks(img_3d: np.ndarray, mask_3d: np.ndarray,
-                                                slab_hw: Union[int, None] = None, smooth_contour: bool = False,
-                                                title: Union[str, None] = None, apply_window: Union[int, None] = None,
-                                                save_file_name: Union[str, None] = None):
-
-    y_index = simpleStats.get_index_of_plane_with_largest_mask_area(mask_3d, dim='y')
-    dict_results = vertebrae_compression_detection_via_auto_landmarks(mask_3d, y_index, slab_hw, smooth_contour)
-    cls_map = class_map['total_v2']
-    cls_map_vert = {k: v for k, v in cls_map.items() if ('e_L' in v) or ('_T12' in v)}
-    dict_colors = set_color_labels_for_display(cls_map_vert)
-    img_2d = get_sectional_view_image(img_3d, 'y', slice_idx=y_index, slab_hw=slab_hw, is_mask=False,
-                                      window_image='SoftTissue', plot_figure=False)
-    mask_2d = get_sectional_view_image(mask_3d, 'y', slice_idx=y_index, slab_hw=slab_hw, is_mask=True,
-                                       plot_figure=False)
-    if apply_window is None:
-        if slab_hw is None:
-            apply_window = 1
-            title = f'{title}: at MA slice' if title is not None else None
-        else:
-            apply_window = 2
-            title = f'{title}: MIP with HW {slab_hw}' if title is not None else None
-    fig, ax = show_mask_superimposed_2d_image(img_2d, mask_2d, dict_colors, alpha=0.5, apply_window=apply_window,
-                                              title=title, cls_map=cls_map_vert, return_fig=True)
-    for obj in dict_results.keys():
-        if 'BBox' in dict_results[obj].keys():
-            grade = dict_results[obj]['Grade']
-            points = dict_results[obj]['Landmarks']
-            points_t = simpleGeometry.get_side_from_closed_curve(points, 'top')
-            points_b = simpleGeometry.get_side_from_closed_curve(points, 'bottom')
-            bbox = simpleGeometry.sort_curve_points_cw(dict_results[obj]['BBox'])
-            # Add back the first point to connect all dots in line plot
-            bbox = np.vstack((bbox, bbox[0, :]))
-            ax.scatter(points_t[:, 0], points_t[:, 1], s=5, c='blue', marker='^')
-            ax.scatter(points_b[:, 0], points_b[:, 1], s=5, c='blue', marker='v')
-            if isinstance(grade, str):
-                ax.plot(bbox[:, 0], bbox[:, 1], 'r--')
-                centroid = np.mean(dict_results[obj]['BBox'], axis=0)
-                ax.text(centroid[0]-5, centroid[1]+2, grade, c='r')
-        else:
-            print_highlighted_text(f'Mask for {obj} is at {list(dict_results[obj].values())[0]} border')
-    if save_file_name is not None:
-        fig.savefig(save_file_name)
-
-
 # noinspection SpellCheckingInspection
 def modify_subcomponent_labels(mask_a: np.ndarray, mask_b: np.ndarray, cls_map_names: List[str],
                                objs_to_modify: Union[list, None] = None):
@@ -1012,5 +928,6 @@ def batch_seg_to_nii_images(dir_input, target_config: NestedDict, coarse: Union[
         for _t in tasks:
             seg_config = get_seg_config_by_task_name(_t, coarse)
             _ = perform_segmentation_generic(_file, seg_config)
+
 
 
