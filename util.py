@@ -1,7 +1,10 @@
 import os
 import re
 import json
+import math
+import random
 import warnings
+import cv2 as cv
 import numpy as np
 import operator
 import pandas as pd
@@ -9,7 +12,16 @@ import networkx as nx
 from shutil import copytree
 from functools import reduce
 import matplotlib.pyplot as plt
+from numpy.ma import masked_array
+from scipy.spatial import KDTree
+from scipy import ndimage as ndi
+from scipy.spatial.transform import Rotation
+from skimage.measure import regionprops
+from skimage.segmentation import watershed
+from skimage.filters import farid, threshold_multiotsu
+from skimage.morphology import disk, remove_small_objects
 from typing import Union, Set, List, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class NpEncoder(json.JSONEncoder):
@@ -208,7 +220,7 @@ def get_value_in_nested_dict_by_path(_dict: dict, _path: Union[list, tuple]):
     return reduce(operator.getitem, _path, _dict)
 
 
-def swap_tuple(_tuple, a: int, b: int):
+def swap_tuple(_tuple: tuple, a: int, b: int):
     _list = list(_tuple)
     _list[b], _list[a] = _list[a], _list[b]
     return tuple(_list)
@@ -267,7 +279,7 @@ def remove_empty_nested_keys(_dict, reset_dict_to_count=False, count_ini=0):
 
 
 def get_files_in_folder(file_dir, ext: Union[str, None] = None, string_in_filename: Union[str, None] = None,
-                        keep_file_with_str=False):
+                        keep_file_with_str=False, append_dir: bool = False):
     files = os.listdir(file_dir)
     if ext is not None:
         files = [file for file in files if file.endswith(ext)]
@@ -277,7 +289,10 @@ def get_files_in_folder(file_dir, ext: Union[str, None] = None, string_in_filena
         else:
             idx_to_keep = np.where(np.array([string_in_filename not in i for i in files]))[0]
         files = [files[i] for i in idx_to_keep]
-    return files
+    if append_dir:
+        return [os.path.join(file_dir, file) for file in files]
+    else:
+        return files
 
 
 def clear_fig_in_memory(fig_keep=None):
@@ -545,3 +560,214 @@ class DirectoryGraph:
     def to_networkx(self) -> nx.DiGraph:
         """Return the NetworkX graph object."""
         return self.graph
+
+
+def get_largest_subset(list_of_sets, thresh=95, seed=None, num_threads=4):
+    """Specialized for high thresholds like 95%"""
+
+    n_sets = len(list_of_sets)
+    required = int(n_sets * thresh / 100)
+
+    # Phase 1: Ultra-fast counting
+    element_counts = {}
+    for s in list_of_sets:
+        for elem in s:
+            element_counts[elem] = element_counts.get(elem, 0) + 1
+
+    # For 95%, we need elements with VERY high frequency
+    frequent_elements = [elem for elem, count in element_counts.items()
+                         if count >= required]
+
+    # With 95% threshold, frequent_elements will be small
+    print(f"{len(frequent_elements)} elements appear in ≥{required} sets")
+
+    if not frequent_elements:
+        return None
+
+    # Sort by frequency
+    frequent_elements.sort(key=lambda e: -element_counts[e])
+
+    # For 95% threshold, ALL elements in the result MUST be in ALL sets
+    # that contain the result. So we can optimize further:
+
+    print('Find sets that contain all frequent elements')
+    universal_sets = []
+    for i, s in enumerate(list_of_sets):
+        if all(elem in s for elem in frequent_elements):
+            universal_sets.append(i)
+
+    # If not enough sets contain all elements, we need to find subsets
+    if len(universal_sets) < required:
+        # We need to find a subset of frequent_elements
+        # that appears in enough sets
+
+        # Parallel exploration of subsets
+        def explore_subsets(subset_indices, local_seed):
+            local_rng = random.Random(local_seed)
+            indices = list(subset_indices)
+            local_rng.shuffle(indices)
+
+            best_local = set()
+            # Try different subset sizes
+            for size in range(len(indices), 0, -1):
+                # Generate combinations
+                from itertools import combinations
+                for combo in combinations(indices, size):
+                    _candidate = {frequent_elements[_i] for _i in combo}
+
+                    # Quick check
+                    count = sum(1 for _s in list_of_sets if _candidate.issubset(_s))
+                    if count >= required:
+                        if len(_candidate) > len(best_local):
+                            best_local = _candidate.copy()
+                        break  # Found valid set of this size
+
+            return best_local
+
+        # Split work among threads
+        all_indices = list(range(len(frequent_elements)))
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = []
+            chunk_size = max(1, len(all_indices) // num_threads)
+
+            for i in range(num_threads):
+                start = i * chunk_size
+                end = start + chunk_size if i < num_threads - 1 else len(all_indices)
+                chunk = all_indices[start:end]
+
+                if chunk:  # Only submit if chunk is not empty
+                    future = executor.submit(explore_subsets, chunk,
+                                             (seed or 0) + i)
+                    futures.append(future)
+
+            # Collect results
+            best_set = set()
+            for future in as_completed(futures):
+                candidate = future.result()
+                if len(candidate) > len(best_set):
+                    best_set = candidate
+
+        return best_set if best_set else None
+    else:
+        return set(frequent_elements)
+
+
+def segment_bright_objects_init(img_2d):
+    # Use edge enhancing filter as an initial step to segment bright objects
+    img_mag_farid = farid(img_2d)
+    # noinspection PyTypeChecker
+    markers = np.zeros_like(img_mag_farid).astype(np.uint8)
+    markers[img_2d < 900] = 1
+    # noinspection PyTypeChecker
+    markers[img_mag_farid > 120 / np.iinfo(img_2d.dtype).max] = 2
+    img_seg = watershed(img_mag_farid, markers)
+    # In most cases the following two lines are enough to segment out bright objects. However, because gradient-based
+    # methods detect also edges of dark objects in the neighborhood of bright objects, 'fill hole' operation will
+    # probably get part of dark objects in the returned segmentations. This is why this method is only the initial step.
+    img_seg = ndi.binary_fill_holes(img_seg - 1)
+    img_seg = ndi.binary_opening(img_seg, disk(2))
+    return img_seg
+
+
+def inpaint_with_kdtree(img, mask):
+    img_masked = masked_array(img, mask)
+    x, y = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+    data = np.array((x[~img_masked.mask], y[~img_masked.mask])).T
+    data_to_replace = np.array((x[img_masked.mask], y[img_masked.mask])).T
+    img_restored = img.copy()
+    img_restored[img_masked.mask] = img_restored[~img_masked.mask][KDTree(data).query(data_to_replace)[1]]
+    return img_restored
+
+
+def get_nonzero_mask_from_image(img):
+    mask = np.zeros_like(img, dtype=bool)
+    mask[img > 0] = True
+    mask = ndi.binary_fill_holes(mask)
+    return mask
+
+
+def get_largest_component(mask: np.ndarray):
+    if mask.dtype == np.bool_:
+        seg_labeled, seg_num = ndi.label(mask)
+    else:
+        seg_labeled = mask
+        seg_num = len(np.unique(mask[mask > 0]))
+    size_arr = np.zeros(seg_num)
+    for i in range(seg_num):
+        size_arr[i] = np.sum(seg_labeled == i + 1)
+    return seg_labeled == np.argmax(size_arr) + 1
+
+
+def get_bbx_from_roi(img, mask=None):
+    """
+    Note: It uses the img_mov_reg to calculate the minimum bound rectangle to cut both the original template image and
+          the registered moving image
+    Args:
+        img: input image.
+
+    :return:
+        [x, y, w, h]: image ROI specified in the rectangular format
+        c
+    """
+    if mask is None:
+        mask = get_nonzero_mask_from_image(img)
+        # Make sure that there is only one component in the mask
+        mask = get_largest_component(mask)
+    # findContours operates on an uint8 image
+    mask_image = 255 * mask
+    mask_image = mask_image.astype(np.uint8)
+    cnt, _ = cv.findContours(mask_image, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+    contour = cnt[0]
+    x, y, w, h = cv.boundingRect(contour)
+    return [x, y, w, h], contour
+
+
+def find_bones_2d(img_2d: np.ndarray, verbose: bool = False):
+    threshold = threshold_multiotsu(img_2d)
+    # noinspection PyTypeChecker
+    img_seg = np.digitize(img_2d, bins=threshold)
+    img_seg[img_seg == 1] = 0
+    img_seg[img_seg == 2] = 1
+    img_seg = ndi.binary_closing(ndi.binary_dilation(img_seg, disk(5)), disk(5))
+    img_seg = ndi.binary_fill_holes(img_seg)
+    img_seg = remove_small_objects(img_seg, min_size=500)
+    seg_labeled, num_obj = ndi.label(img_seg)
+    if verbose:
+        print('Find {} large objects'.format(num_obj))
+        for i in range(num_obj):
+            seg = seg_labeled == i + 1
+            rect, _ = get_bbx_from_roi(img_seg, seg)
+            print('Bounding box rectangle: {}'.format(rect))
+    return seg_labeled
+
+
+# noinspection SpellCheckingInspection
+def get_image_rotation_by_z(img_3d: np.ndarray, return_angle: bool = False, return_seg: bool = False,
+                            verbose: bool = False):
+    img_ax = np.max(img_3d, axis=2)
+    mask = segment_bright_objects_init(img_ax)
+    img_ax_re = inpaint_with_kdtree(img_ax, mask)
+    img_ax_bone = find_bones_2d(img_ax_re)
+    seg_props = regionprops(img_ax_bone)
+    idx_torso = [idx for idx, item in enumerate(seg_props) if item.area == max([i.area for i in seg_props])][0]
+    theta_rad = seg_props[idx_torso].orientation  # angle in radians
+    theta_deg = np.rad2deg(theta_rad)
+    if verbose:
+        print('The image is rotated by {} degrees'.format(theta_deg))
+    if theta_rad < 0:
+        theta_deg = - 90 - theta_deg
+        r = Rotation.from_euler('z', - math.pi / 2 - theta_rad)
+    else:
+        r = Rotation.from_euler('z', theta_rad)
+    rmat = r.as_matrix()
+    if return_angle:
+        return rmat, theta_deg
+    else:
+        return rmat
+
+
+def rotate_image_by_z(img_3d: np.ndarray, angle: float):
+    return ndi.rotate(img_3d, angle, order=1, cval=np.min(img_3d))
+
+
