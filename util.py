@@ -2,7 +2,9 @@ import os
 import re
 import json
 import math
+import base64
 import random
+import string
 import warnings
 import cv2 as cv
 import numpy as np
@@ -11,6 +13,7 @@ import pandas as pd
 import networkx as nx
 from shutil import copytree
 from functools import reduce
+from inspect import signature
 import matplotlib.pyplot as plt
 from numpy.ma import masked_array
 from scipy.spatial import KDTree
@@ -36,12 +39,10 @@ class NpEncoder(json.JSONEncoder):
 
 
 def encode_string(_str: str):
-    import base64
     return (base64.b64encode(_str.encode('ascii'))).decode('ascii')
 
 
 def decode_string(_str: str):
-    import base64
     return (base64.b64decode(_str.encode('ascii'))).decode('ascii')
 
 
@@ -61,23 +62,33 @@ def write_json(data, json_file, sort_keys: bool = False):
 
 
 def copy_file(dir_src, dir_des, dict_patient_include):
-    import progressbar
+    from tqdm import tqdm
 
     num_patient = sum([len(v) for v in dict_patient_include.values()])
-    num = 0
-    with progressbar.ProgressBar(max_value=num_patient) as bar:
+    for i in tqdm(range(num_patient)):
         for cls in dict_patient_include.keys():
             dir_sub = os.listdir(os.path.join(dir_src, cls))
             for _f in dir_sub:
                 if str(_f).split(' ')[0] in dict_patient_include[cls]:
-                    num += 1
                     if os.path.isdir(os.path.join(dir_des, cls, str(_f).split(' ')[0])):
                         continue
                     else:
                         print(f'Copy files from {os.path.join(dir_src, cls, _f)} to {dir_des}...')
                         copytree(os.path.join(dir_src, cls, _f), os.path.join(dir_des, cls, str(_f).split(' ')[0]))
-                    bar.update(num)
 
+
+def random_alphanumeric(length=12, digits_count=3):
+    digits = random.choices(string.digits, k=digits_count)
+    letters = random.choices(string.ascii_uppercase, k=length - digits_count)
+    result = digits + letters
+    random.shuffle(result)
+    return ''.join(result)
+
+
+def has_parameter(func, var_name):
+    sig = signature(func)
+    return var_name in sig.parameters
+    
 
 def sort_list_by_idx_e_in_tuple(tuples_list: List[tuple], key_idx: int = 0, skip_idx_e: bool = True,
                                 reverse: bool = False, return_index: bool = False):
@@ -769,5 +780,6 @@ def get_image_rotation_by_z(img_3d: np.ndarray, return_angle: bool = False, retu
 
 def rotate_image_by_z(img_3d: np.ndarray, angle: float):
     return ndi.rotate(img_3d, angle, order=1, cval=np.min(img_3d))
+
 
 
