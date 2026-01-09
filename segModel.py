@@ -1,7 +1,9 @@
 import os
 import re
 import time
+import types
 import shutil
+import importlib
 import subprocess
 import warnings
 import cv2 as cv
@@ -11,43 +13,76 @@ import matplotlib
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from pathlib import Path
-from scipy import ndimage as ndi
 from numpy.typing import NDArray
-from typing import Union, List
+from typing import Union, List, Callable, Optional
 from skimage.measure import regionprops
 from skimage.filters import farid, threshold_multiotsu
-from totalsegmentator import nnunet
-from totalsegmentator import postprocessing
-from totalsegmentator.resampling import resample_img
-from totalsegmentator.map_to_binary import class_map
 from skimage.morphology import disk, remove_small_objects, skeletonize
-from util import print_highlighted_text, normalized_image_to_8bit, segment_bright_objects_init
+from util import print_highlighted_text, normalized_image_to_8bit, segment_bright_objects_init, ndi, has_parameter
 
 
+matplotlib.use('QtAgg')
 v_totalsegmentator = None
 v_str = None
-matplotlib.use('QtAgg')
+nnunet_engine: Optional[types.ModuleType] = None
+class_map: Optional[dict] = None
+postprocessing: Optional[types.ModuleType] = None
+resample_img: Optional[Callable] = None
 
 
 # noinspection SpellCheckingInspection
-def get_segmentator_version():
+def get_segmentator_version(print_msg=False):
     global v_totalsegmentator
     global v_str
+
     if v_totalsegmentator is None:
-        from totalsegmentator.config import setup_nnunet
-        setup_nnunet()
-        import importlib
-        from nnunet import paths
-        importlib.reload(paths)
-        importlib.reload(nnunet)
-        print(f'Configured directory for TotalSegmentator models: {paths.network_training_output_dir}')
         # noinspection PyUnresolvedReferences
         v_str = importlib.metadata.distribution('totalsegmentator').version
         v_totalsegmentator = int(v_str.split('.')[0])
-    print(f'Installed TotalSegmentator version: {v_str}')
+        if print_msg:
+            print(f'Installed TotalSegmentator version: {v_str}')
 
 
-get_segmentator_version()
+# noinspection SpellCheckingInspection
+def setup_nnunet():
+    global nnunet_engine
+    global class_map
+    global postprocessing
+    global resample_img
+
+    get_segmentator_version(True)
+    # check if environment variable totalsegmentator_config is set
+    if "TOTALSEG_WEIGHTS_PATH" in os.environ:
+        weights_dir = os.environ["TOTALSEG_WEIGHTS_PATH"]
+    else:
+        raise ValueError("The 'TOTALSEG_WEIGHTS_PATH' variable must be set in the system environment!")
+
+    if v_totalsegmentator == 1:
+        os.environ['nnUNet_raw_data_base'] = weights_dir
+        os.environ["nnUNet_preprocessed"] = weights_dir
+        os.environ["RESULTS_FOLDER"] = weights_dir
+        paths = getattr(importlib.import_module('nnunet'), 'paths')
+        print(f'Configured directory for TotalSegmentator models: {paths.network_training_output_dir}')
+    else:
+        # weights_dir = os.path.join(weights_dir, 'nnUNet', '3d_fullres')
+        for (parent, subdir, _files) in os.walk(weights_dir):
+            if 'Dataset' in parent:
+                dir_parent = os.path.dirname(parent)
+                os.environ["nnUNet_raw"] = dir_parent
+                os.environ["nnUNet_preprocessed"] = dir_parent
+                os.environ['nnUNet_results'] = dir_parent
+                break
+        paths = getattr(importlib.import_module('nnunetv2'), 'paths')
+        print(f'Configured directory for TotalSegmentator models: {paths.nnUNet_results}')
+
+    nnunet_engine = getattr(importlib.import_module('totalsegmentator'), 'nnunet')
+    class_map = getattr(importlib.import_module('totalsegmentator.map_to_binary'), 'class_map')
+    postprocessing = getattr(importlib.import_module('totalsegmentator'), 'postprocessing')
+    resample_img = getattr(importlib.import_module('totalsegmentator.resampling'), 'resample_img')
+
+
+# Run setup_nnunet() as other functions are dependent on it. 
+setup_nnunet()
 
 
 # noinspection SpellCheckingInspection
@@ -172,7 +207,8 @@ segmentation_settings = {
 # noinspection SpellCheckingInspection
 def image_resample(data: Union[np.ndarray, nib.nifti1.Nifti1Image], voxel_size: Union[tuple, np.ndarray, None] = None,
                    target_voxel_size: Union[float, tuple, None] = None, order=0, remove_negative=False):
-
+    if resample_img is None:
+        raise RuntimeError("Must run setup_nnunet() before using dependent functions")
     if isinstance(data, np.ndarray):
         assert voxel_size is not None
         is_array = True
@@ -360,18 +396,65 @@ def validate_nifti_image_dtype(image: nib.Nifti1Image, return_dtype: bool = Fals
 
 
 # noinspection SpellCheckingInspection
+def nnUNet_predict_v_idp(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
+                         trainer="nnUNetTrainer", tta=False,
+                         num_threads_preprocessing=3, num_threads_nifti_save=2,
+                         plans="nnUNetPlans", device="cuda", quiet=False, step_size=None,
+                         save_probabilities_path=None):
+    if nnunet_engine is None:
+        raise RuntimeError("Must run setup_nnunet() before using dependent functions")
+
+    if v_totalsegmentator == 1:
+        # noinspection PyUnresolvedReferences
+        nnunet_engine.nnUNet_predict(dir_in, dir_out, task_id, model, folds, trainer, tta,
+                                     num_threads_preprocessing, num_threads_nifti_save)
+    else:
+        if step_size is None:
+            step_size = 0.5
+        save_probabilities = True if save_probabilities_path is not None else False
+        save_no_prob = True
+        if save_probabilities_path is not None:
+            # noinspection PyUnresolvedReferences
+            if has_parameter(nnunet_engine.nnUNetv2_predict, save_probabilities_path):
+                save_no_prob = False
+            else:
+                print('Your TotalSegmentator version does not support saving probabilities!')
+        find_candidate_datasets = getattr(importlib.import_module('nnunetv2.utilities.dataset_name_id_conversion'),
+                                          'find_candidate_datasets')
+        folder = find_candidate_datasets(task_id)
+        if folder is None:
+            raise RuntimeError('Directory for model weights is not properly configured')
+        else:
+            print(folder)
+        nnUNet_results = getattr(importlib.import_module('nnunetv2.paths'), 'nnUNet_results')
+        if nnUNet_results is None:
+            raise ValueError('Directory for model weights is not properly configured')
+        else:
+            print(nnUNet_results)
+        if save_no_prob:
+            # noinspection PyUnresolvedReferences
+            nnunet_engine.nnUNetv2_predict(dir_in, dir_out, task_id, model, folds, trainer, tta,
+                                           num_threads_preprocessing, num_threads_nifti_save,
+                                           plans=plans, device=device, quiet=quiet, step_size=step_size)
+        else:
+            # noinspection PyUnresolvedReferences
+            nnunet_engine.nnUNetv2_predict(dir_in, dir_out, task_id, model, folds, trainer, tta,
+                                           num_threads_preprocessing, num_threads_nifti_save,
+                                           plans=plans, device=device, quiet=quiet, step_size=step_size,
+                                           save_probabilities_path=save_probabilities)
+
+
+# noinspection SpellCheckingInspection
 def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: Union[str, Path, None], task_id,
                          model="3d_fullres", folds=None, trainer="nnUNetTrainerV2", tta=False,
                          multilabel_image=True, resample=None, crop=None, crop_path=None, task_name="total",
                          nora_tag: Union[str, None] = None, preview=False, nr_threads_resampling=1,
                          nr_threads_saving=6, force_split=False, crop_addon=(3, 3, 3), roi_subset=None,
                          output_type="nifti", quiet=False, verbose=False, test=0, skip_saving=False, device="cuda",
-                         no_derived_masks=False, v1_order=False, remove_auxiliary: Union[bool, None] = None,
-                         remove_small_blobs=False, save_label_to_nifti: Union[bool, None] = None):
+                         no_derived_masks=False, v1_order=False, remove_auxiliary: Optional[bool] = None,
+                         remove_small_blobs=False, save_label_to_nifti=False, save_probabilities=None):
 
     """
-    crop: string or a nibabel image
-    resample: None or float (target spacing for all dimensions) or list of floats
     """
 
     def _save_and_return_result(_img_out: nib.Nifti1Image, _label_map: dict):
@@ -404,11 +487,9 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
     def _postprocess_multilabel(data: np.ndarray, _label_map: dict, rois: List[str], func_name: str, interval=None):
         """
         Keep the largest blob for the classes defined in rois.
-
         data: multilabel image (np.array)
         class_map: class map {label_idx: label_name}
         rois: list of labels where to filter for the largest blob
-
         return multilabel image (np.array)
         """
         assert func_name in ('remove_small_blobs', 'keep_largest_blob')
@@ -421,8 +502,10 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
                     assert interval is not None
                 except AssertionError:
                     NameError("ERROR: To remove small blobs, size interval should be supplied!")
+                # noinspection PyUnresolvedReferences
                 cleaned_roi = postprocessing.remove_small_blobs(data_roi, interval=interval) > 0.5
             else:
+                # noinspection PyUnresolvedReferences
                 cleaned_roi = postprocessing.keep_largest_blob(data_roi) > 0.5
             data[data_roi] = 0  # Clear the original ROI in data
             data[cleaned_roi] = _label  # Write back the cleaned ROI into data
@@ -453,7 +536,10 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
         output_file_no_ext = output_path.name.split('.')[0]
         subprocess.call(f'"{dcm2niix}" -o "{output_path.parent}" -z y -f "{output_file_no_ext}" "{input_path}"')
         os.remove(os.path.join(output_path.parent, output_file_no_ext + ".json"))
-    
+
+    if nnunet_engine is None:
+        raise RuntimeError("Must run 'setup_nnunet()' before using dependent functions")
+
     if isinstance(file_in, (str, Path)):
         if isinstance(file_in, Path):
             str_file_in = str(file_in)
@@ -478,7 +564,8 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
     if type(resample) is float:
         resample = [resample, resample, resample]
     v_tt = v_totalsegmentator
-    with nnunet.tempfile.TemporaryDirectory(prefix="nnunet_tmp_") as tmp_folder:
+    # noinspection PyUnresolvedReferences
+    with nnunet_engine.tempfile.TemporaryDirectory(prefix="nnunet_tmp_") as tmp_folder:
         tmp_dir = Path(tmp_folder)
         if verbose:
             print(f"tmp_dir: {tmp_dir}")
@@ -508,29 +595,32 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
             if type(crop) is str:
                 if v_tt == 1:
                     if crop == "lung" or crop == "pelvis" or crop == "heart":
-                        nnunet.combine_masks(crop_path, crop_path / f"{crop}.nii.gz", crop)
+                        # noinspection PyUnresolvedReferences
+                        nnunet_engine.combine_masks(crop_path, crop_path / f"{crop}.nii.gz", crop)
                 else:
                     if crop == "lung" or crop == "pelvis":
                         # noinspection PyArgumentList
-                        nnunet.combine_masks(crop_path, crop)
+                        # noinspection PyUnresolvedReferences
+                        nnunet_engine.combine_masks(crop_path, crop)
                 crop_mask_img = nib.load(crop_path / f"{crop}.nii.gz")
             else:
                 crop_mask_img = crop
-            img_in, bbox = nnunet.crop_to_mask(img_in, crop_mask_img,
-                                               addon=crop_addon, dtype=np.int32,
-                                               verbose=verbose)
+            # noinspection PyUnresolvedReferences
+            img_in, bbox = nnunet_engine.crop_to_mask(img_in, crop_mask_img,
+                                                      addon=crop_addon, dtype=np.int32,
+                                                      verbose=verbose)
             if not quiet:
                 print(f"  cropping from {crop_mask_img.shape} to {img_in.shape}")
-
-        img_in = nnunet.as_closest_canonical(img_in)
+        # noinspection PyUnresolvedReferences
+        img_in = nnunet_engine.as_closest_canonical(img_in)
         if resample is not None:
             if not quiet:
                 print("Resampling...")
             st = time.time()
             img_in_shape = img_in.shape
-            img_in_rsp = nnunet.change_spacing(img_in, resample,
-                                               order=3, dtype=np.int32,
-                                               nr_cpus=nr_threads_resampling)  # 4 cpus instead of 1 makes it slower
+            # noinspection PyUnresolvedReferences
+            img_in_rsp = nnunet_engine.change_spacing(img_in, resample, order=3, dtype=np.int32,
+                                                      nr_cpus=nr_threads_resampling)  # 4 cpus instead of 1 runs slower
             if verbose:
                 print(f"  from shape {img_in.shape} to shape {img_in_rsp.shape}")
             if not quiet:
@@ -572,23 +662,26 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
         st = time.time()
         if multimodel:  # if running multiple models
             if v_tt == 1:
-                class_map_parts = nnunet.class_map_5_parts
-                map_taskid_to_partname = nnunet.map_taskid_to_partname
+                # noinspection PyUnresolvedReferences
+                class_map_parts = nnunet_engine.class_map_5_parts
+                # noinspection PyUnresolvedReferences
+                map_taskid_to_partname = nnunet_engine.map_taskid_to_partname
             else:
                 if task_name == "total":
-                    class_map_parts = nnunet.class_map_5_parts
                     # noinspection PyUnresolvedReferences
-                    map_taskid_to_partname = nnunet.map_taskid_to_partname_ct
+                    class_map_parts = nnunet_engine.class_map_5_parts
+                    # noinspection PyUnresolvedReferences
+                    map_taskid_to_partname = nnunet_engine.map_taskid_to_partname_ct
                 elif task_name == "total_mr":
                     # noinspection PyUnresolvedReferences
-                    class_map_parts = nnunet.class_map_parts_mr
+                    class_map_parts = nnunet_engine.class_map_parts_mr
                     # noinspection PyUnresolvedReferences
-                    map_taskid_to_partname = nnunet.map_taskid_to_partname_mr
+                    map_taskid_to_partname = nnunet_engine.map_taskid_to_partname_mr
                 elif task_name == "headneck_muscles":
                     # noinspection PyUnresolvedReferences
-                    class_map_parts = nnunet.class_map_parts_headneck_muscles
+                    class_map_parts = nnunet_engine.class_map_parts_headneck_muscles
                     # noinspection PyUnresolvedReferences
-                    map_taskid_to_partname = nnunet.map_taskid_to_partname_headneck_muscles
+                    map_taskid_to_partname = nnunet_engine.map_taskid_to_partname_headneck_muscles
             # only compute model parts containing the roi subset
             if roi_subset is not None:
                 part_names = []
@@ -615,15 +708,12 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
                 # Run several tasks and combine results into one segmentation
                 for idx, tid in enumerate(task_id):
                     if not quiet: print(f"Predicting part {idx +1} of {len(task_id)} ...")
-                    with nnunet.nostdout(verbose):
-                        if v_tt == 1:
-                            nnunet.nnUNet_predict(tmp_dir, tmp_dir, tid, model, folds, trainer, tta,
-                                                  nr_threads_resampling, nr_threads_saving)
-                        else:
-                            # noinspection PyUnresolvedReferences
-                            nnunet.nnUNetv2_predict(tmp_dir, tmp_dir, tid, model, folds, trainer, tta,
-                                                    nr_threads_resampling, nr_threads_saving,
-                                                    device=device, quiet=quiet, step_size=step_size)
+                    # noinspection PyUnresolvedReferences
+                    with nnunet_engine.nostdout(verbose):
+                        nnUNet_predict_v_idp(tmp_dir, tmp_dir, tid, model, folds, trainer, tta,
+                                             nr_threads_resampling, nr_threads_saving,
+                                             device=device, quiet=quiet, step_size=step_size,
+                                             save_probabilities_path=save_probabilities)
                     # iterate over models (different sets of classes)
                     for img_part in img_parts:
                         (tmp_dir / f"{img_part}.nii.gz").rename(tmp_dir / "parts" / f"{img_part}_{tid}.nii.gz")
@@ -641,18 +731,20 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
             if not quiet:
                 print("Predicting...")
             if test == 0:
-                with nnunet.nostdout(verbose):
+                # noinspection PyUnresolvedReferences
+                with nnunet_engine.nostdout(verbose):
                     if v_tt == 1:
-                        nnunet.nnUNet_predict(tmp_dir, tmp_dir, task_id, model, folds, trainer, tta,
-                                              nr_threads_resampling, nr_threads_saving)
+                        # noinspection PyUnresolvedReferences
+                        nnunet_engine.nnUNet_predict(tmp_dir, tmp_dir, task_id, model, folds, trainer, tta,
+                                                     nr_threads_resampling, nr_threads_saving)
                     else:
                         # noinspection PyUnresolvedReferences
-                        nnunet.nnUNetv2_predict(tmp_dir, tmp_dir, task_id, model,
-                                                folds, trainer, tta,
-                                                nr_threads_resampling,
-                                                nr_threads_saving,
-                                                device=device, quiet=quiet,
-                                                step_size=step_size)
+                        nnunet_engine.nnUNetv2_predict(tmp_dir, tmp_dir, task_id, model,
+                                                       folds, trainer, tta,
+                                                       nr_threads_resampling,
+                                                       nr_threads_saving,
+                                                       device=device, quiet=quiet,
+                                                       step_size=step_size)
             elif test == 3:
                 print("WARNING: Using reference seg instead of prediction for testing.")
                 shutil.copy(Path("tests") / "reference_files" / "example_seg_lung_vessels.nii.gz", tmp_dir / "s01.nii.gz")
@@ -726,21 +818,24 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
                 print(f"  back to original shape: {img_in_shape}")
             # Use force_affine otherwise output affine sometimes slightly off (which then is even increased
             # by undo_canonical)
-            img_pred = nnunet.change_spacing(img_pred, resample, img_in_shape,
-                                             order=0, dtype=np.uint8,
-                                             nr_cpus=nr_threads_resampling,
-                                             force_affine=img_in.affine)
+            # noinspection PyUnresolvedReferences
+            img_pred = nnunet_engine.change_spacing(img_pred, resample, img_in_shape,
+                                                    order=0, dtype=np.uint8,
+                                                    nr_cpus=nr_threads_resampling,
+                                                    force_affine=img_in.affine)
 
         if verbose:
             print("Undoing canonical...")
-        img_pred = nnunet.undo_canonical(img_pred, img_in_orig)
+        # noinspection PyUnresolvedReferences
+        img_pred = nnunet_engine.undo_canonical(img_pred, img_in_orig)
 
         if crop is not None:
             if verbose:
                 print("Undoing cropping...")
-            img_pred = nnunet.undo_crop(img_pred, img_in_orig, bbox)
-
-        nnunet.check_if_shape_and_affine_identical(img_in_orig, img_pred)
+            # noinspection PyUnresolvedReferences
+            img_pred = nnunet_engine.undo_crop(img_pred, img_in_orig, bbox)
+        # noinspection PyUnresolvedReferences
+        nnunet_engine.check_if_shape_and_affine_identical(img_in_orig, img_pred)
 
         # Prepare output nifti
         # Copy header to make output header exactly the same as input. But change dtype otherwise it will be
@@ -759,20 +854,23 @@ def nnUNet_predict_image(file_in: Union[str, Path, nib.Nifti1Image], file_out: U
                 if not quiet:
                     print("Creating body.nii.gz")
                 if v_tt == 1:
-                    nnunet.combine_masks(file_out, file_out / "body.nii.gz", "body")
+                    # noinspection PyUnresolvedReferences
+                    nnunet_engine.combine_masks(file_out, file_out / "body.nii.gz", "body")
                 else:
                     # noinspection PyArgumentList
-                    body_img = nnunet.combine_masks(file_out, "body")
+                    # noinspection PyUnresolvedReferences
+                    body_img = nnunet_engine.combine_masks(file_out, "body")
                     nib.save(body_img, file_out / "body.nii.gz")
                 if not quiet:
                     print("Creating skin.nii.gz")
-                skin = nnunet.extract_skin(img_in_orig, nib.load(file_out / "body.nii.gz"))
+                # noinspection PyUnresolvedReferences
+                skin = nnunet_engine.extract_skin(img_in_orig, nib.load(file_out / "body.nii.gz"))
                 nib.save(skin, file_out / "skin.nii.gz")
     return img_out
 
 
 # noinspection SpellCheckingInspection
-def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bool = True)\
+def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bool = True, rerun: bool = False)\
         -> Union[nib.Nifti1Image, np.ndarray]:
     # For the time being, it is not recommended to save segmentation results after postfix directly as more
     # sub-functions will be added to improve the postfix method.
@@ -781,10 +879,11 @@ def perform_segmentation_generic(file_in: str, seg_config: dict, save_output: bo
     :param seg_config: a dict that contains information about 'task_id', 'trainer', 'voxel_size', 'crop' and might
                        include 'crop_addon' as well;
     :param save_output: bool on whether to save the output image;
+    :param rerun: bool on whether to rerun the segmentation;
     :return: result: either as an image in nifti format or as a numpy array
     """
     file_out = set_seg_file_name(file_in, seg_config)
-    if not os.path.isfile(file_out):
+    if not os.path.isfile(file_out) or rerun:
         crop_addon = [3, 3, 3] if 'crop_addon' not in seg_config else seg_config['crop_addon']
         multilabel = True if 'multilabel' not in seg_config else seg_config['multilabel']
         trainer = seg_config['trainer']
@@ -1081,5 +1180,6 @@ def get_bright_objects(img_2d, idx_patient=-1, patient_id='', aspect=1, area_thr
             fig.show()
 
     return seg_labeled
+
 
 
