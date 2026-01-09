@@ -22,7 +22,7 @@ Wasserthal, J., Breit, H.-C., Meyer, M.T., Pradella, M., Hinck, D., Sauter, A.W.
 
 # Example for doing body composition
 ```
-from totalsegmentator.config import setup_nnunet
+from segModel import setup_nnunet
 from featureAnalyzer import body_component_analysis, NestedDict
 
 
